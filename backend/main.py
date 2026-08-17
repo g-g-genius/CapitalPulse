@@ -8,6 +8,7 @@ import uvicorn
 from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 
+from config import HOST, PORT
 from routers import sector_flow_realtime, stock_flow_realtime
 from services.sector_flow_realtime import sector_flow_service
 from services.stock_flow_realtime import stock_flow_service
@@ -83,8 +84,8 @@ async def stock_flow_ws(
 if __name__ == "__main__":
     uvicorn.run(
         "main:app",
-        host="0.0.0.0",
-        port=8000,
+        host=HOST,
+        port=PORT,
         log_level="info",
         reload=False,
     )

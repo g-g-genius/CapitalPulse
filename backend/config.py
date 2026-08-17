@@ -1,7 +1,35 @@
 """Configuration for the real-time sector capital-flow service."""
 
-HOST = "0.0.0.0"
-PORT = 8000
+import os
+from pathlib import Path
+
+from dotenv import load_dotenv
+
+
+BACKEND_DIR = Path(__file__).resolve().parent
+
+
+def load_environment(env_file: Path = BACKEND_DIR / ".env") -> bool:
+    """Load backend settings without replacing deployment-level variables."""
+    return load_dotenv(env_file, override=False)
+
+
+# Run before service singletons read os.environ.
+load_environment()
+
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", "8000"))
+
+
+def env_path(name: str, default: Path) -> Path:
+    """Read a path setting, resolving relative values from the backend directory."""
+    value = os.getenv(name)
+    if not value:
+        return default
+    path = Path(value).expanduser()
+    if path.is_absolute():
+        return path
+    return BACKEND_DIR / path
 
 REQUEST_TIMEOUT = 10.0
 MAX_RETRIES = 2

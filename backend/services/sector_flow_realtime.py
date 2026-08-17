@@ -17,6 +17,7 @@ from fastapi import WebSocket, WebSocketDisconnect
 from config import (
     EASTMONEY_SECTOR_FLOW_SNAPSHOT_FALLBACK_URL,
     EASTMONEY_SECTOR_FLOW_SNAPSHOT_URL,
+    env_path,
 )
 from services.sector_flow_upstream import (
     build_eastmoney_params,
@@ -127,7 +128,7 @@ class SectorFlowRealtimeService:
         self.enabled = _env_bool("SECTOR_FLOW_ENABLED", True)
         self.poll_seconds = max(1.0, float(os.getenv("SECTOR_FLOW_POLL_SECONDS", "3")))
         self.retention_days = max(1, int(os.getenv("SECTOR_FLOW_RETENTION_DAYS", "30")))
-        self.db_path = Path(os.getenv("SECTOR_FLOW_DB_PATH", str(DEFAULT_DB_PATH)))
+        self.db_path = env_path("SECTOR_FLOW_DB_PATH", DEFAULT_DB_PATH)
         self._connection: sqlite3.Connection | None = None
         self._task: asyncio.Task[None] | None = None
         self._backfill_task: asyncio.Task[None] | None = None

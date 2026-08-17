@@ -14,6 +14,7 @@ from typing import Any
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+from config import env_path
 from services.sector_flow_realtime import (
     CST,
     DEFAULT_DB_PATH,
@@ -38,7 +39,7 @@ class StockFlowRealtimeService:
     def __init__(self) -> None:
         self.poll_seconds = max(1.0, float(os.getenv("STOCK_FLOW_POLL_SECONDS", "3")))
         self.retention_days = max(1, int(os.getenv("SECTOR_FLOW_RETENTION_DAYS", "30")))
-        self.db_path = Path(os.getenv("SECTOR_FLOW_DB_PATH", str(DEFAULT_DB_PATH)))
+        self.db_path = env_path("SECTOR_FLOW_DB_PATH", DEFAULT_DB_PATH)
         self._connection: sqlite3.Connection | None = None
         self.runtime_id = ""
         self._clients: dict[str, set[WebSocket]] = {}
