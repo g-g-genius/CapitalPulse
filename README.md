@@ -156,3 +156,9 @@ bun run dev:web
 ## License
 
 本项目采用 [MIT License](LICENSE) 开源。
+
+## 作者
+
+- 小红书：[阿溪研究点啥](https://www.xiaohongshu.com/user/profile/62af3f61000000001902be20)
+
+分享财经信息、实用工具和AI前沿，欢迎交流~
