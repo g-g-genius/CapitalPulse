@@ -973,6 +973,10 @@ export default function SectorFlowPage() {
   const chartContainer = useRef<HTMLDivElement | null>(null)
   const chartRef = useRef<ECharts | null>(null)
   const chartOptionRef = useRef<EChartsOption>({})
+  const visibleCodesRef = useRef<Set<string>>(new Set())
+  const hoveredCodeRef = useRef<string | null>(null)
+  const pinnedCodeRef = useRef<string | null>(null)
+  const highlightedCodeRef = useRef<string | null>(null)
   const socketRef = useRef<WebSocket | null>(null)
   const stockSocketRef = useRef<WebSocket | null>(null)
   const reconnectTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -992,6 +996,8 @@ export default function SectorFlowPage() {
   const [loadError, setLoadError] = useState<string | null>(null)
   const [flashingEndpoints, setFlashingEndpoints] = useState<Set<string>>(() => new Set())
   const [chartMode, setChartMode] = useState<ChartMode>('main')
+  const [hoveredCode, setHoveredCode] = useState<string | null>(null)
+  const [pinnedCode, setPinnedCode] = useState<string | null>(null)
   const [detailPage, setDetailPage] = useState(1)
   const [detailPages, setDetailPages] = useState<Record<number, DetailHistoryPage>>({})
   const [detailLoadingPage, setDetailLoadingPage] = useState<number | null>(null)
@@ -1395,12 +1401,55 @@ export default function SectorFlowPage() {
     }
   }, [chartMode, selectedStock, stockRuntimeId])
 
+  const highlightSector = useCallback((code: string | null) => {
+    const chart = chartRef.current
+    if (!chart || highlightedCodeRef.current === code) return
+    if (highlightedCodeRef.current) {
+      chart.dispatchAction({ type: 'downplay', seriesId: highlightedCodeRef.current })
+    }
+    if (code) chart.dispatchAction({ type: 'highlight', seriesId: code })
+    highlightedCodeRef.current = code
+  }, [])
+
   useEffect(() => {
     let disposed = false
     void import('echarts').then((echarts) => {
       if (disposed || !chartContainer.current) return
-      chartRef.current = echarts.init(chartContainer.current, undefined, { renderer: 'canvas' })
-      chartRef.current.setOption(chartOptionRef.current, { notMerge: true, lazyUpdate: true })
+      const chart = echarts.init(chartContainer.current, undefined, { renderer: 'canvas' })
+      chartRef.current = chart
+      chart.setOption(chartOptionRef.current, { notMerge: true, lazyUpdate: true })
+
+      const eventCode = (params: { seriesId?: string; seriesIndex?: number }) => {
+        const optionSeries = chartOptionRef.current.series
+        const seriesId = typeof params.seriesIndex === 'number' && Array.isArray(optionSeries)
+          ? optionSeries[params.seriesIndex]?.id
+          : params.seriesId
+        const code = seriesId == null ? null : String(seriesId).replace(/-label-connector$/, '')
+        return code && visibleCodesRef.current.has(code) ? code : null
+      }
+      const clearHover = () => {
+        if (!hoveredCodeRef.current) return
+        hoveredCodeRef.current = null
+        setHoveredCode(null)
+        highlightSector(pinnedCodeRef.current)
+      }
+      chart.on('mouseover', (params) => {
+        const code = eventCode(params)
+        if (!code || hoveredCodeRef.current === code) return
+        hoveredCodeRef.current = code
+        setHoveredCode(code)
+        highlightSector(code)
+      })
+      chart.on('mouseout', clearHover)
+      chart.getZr().on('globalout', clearHover)
+      chart.on('click', (params) => {
+        const code = eventCode(params)
+        if (!code) return
+        const next = pinnedCodeRef.current === code ? null : code
+        pinnedCodeRef.current = next
+        setPinnedCode(next)
+        highlightSector(hoveredCodeRef.current ?? next)
+      })
     })
     const resize = () => chartRef.current?.resize()
     window.addEventListener('resize', resize)
@@ -1409,14 +1458,23 @@ export default function SectorFlowPage() {
       window.removeEventListener('resize', resize)
       chartRef.current?.dispose()
       chartRef.current = null
+      highlightedCodeRef.current = null
     }
-  }, [])
+  }, [highlightSector])
 
   const visibleSelection = history.selection
   const visibleCodes = useMemo(
     () => new Set(visibleSelection.map((item) => item.sector_code)),
     [visibleSelection],
   )
+  useEffect(() => {
+    visibleCodesRef.current = visibleCodes
+    if (pinnedCodeRef.current && !visibleCodes.has(pinnedCodeRef.current)) {
+      pinnedCodeRef.current = null
+      setPinnedCode(null)
+      highlightSector(hoveredCodeRef.current)
+    }
+  }, [highlightSector, visibleCodes])
   const visibleLatest = useMemo(
     () => history.latest.filter((item) => visibleCodes.has(item.sector_code)),
     [history.latest, visibleCodes],
@@ -1425,6 +1483,13 @@ export default function SectorFlowPage() {
     () => new Map(visibleLatest.map((item) => [item.sector_code, item])),
     [visibleLatest],
   )
+  const focusedCode = hoveredCode ?? pinnedCode
+  const focusedSector = focusedCode
+    ? history.series.find((item) => item.sector_code === focusedCode)
+    : null
+  const focusedLatest = focusedSector
+    ? latestByCode.get(focusedSector.sector_code)?.main_net ?? focusedSector.points.at(-1)?.[1] ?? 0
+    : 0
 
   const chartOption = useMemo<EChartsOption>(() => {
     const visibleSeries = history.series.filter((item) => visibleCodes.has(item.sector_code))
@@ -1470,11 +1535,14 @@ export default function SectorFlowPage() {
         data: values,
         encode: { x: 0, y: 1 },
         showSymbol: false,
+        triggerLineEvent: true,
+        cursor: 'pointer',
         sampling: 'lttb',
         animationDurationUpdate: 300,
         lineStyle: { width: Math.abs(latest) > 1e9 ? 2 : 1.2, color, opacity: 0.82 },
         itemStyle: { color },
-        emphasis: { focus: 'series', lineStyle: { width: 3 } },
+        emphasis: { focus: 'series', lineStyle: { width: 4, opacity: 1 } },
+        blur: { lineStyle: { opacity: 0.08 } },
       })
 
       if (!endpoint) return
@@ -1487,9 +1555,10 @@ export default function SectorFlowPage() {
         data: [endpoint, [MAIN_LABEL_ANCHOR_SECONDS, labelY]],
         encode: { x: 0, y: 1 },
         showSymbol: true,
+        triggerLineEvent: true,
+        cursor: 'pointer',
         symbol: 'circle',
         symbolSize: 4,
-        silent: true,
         tooltip: { show: false },
         animationDurationUpdate: 300,
         z: 2,
@@ -1546,26 +1615,7 @@ export default function SectorFlowPage() {
       animationDuration: 0,
       animationDurationUpdate: 300,
       grid: { left: 60, right: 158, top: 32, bottom: 38, containLabel: true },
-      tooltip: {
-        trigger: 'axis',
-        confine: true,
-        renderMode: 'richText',
-        formatter: (params: unknown) => {
-          const items = (Array.isArray(params) ? params : [params]) as Array<{
-            seriesName?: string
-            value?: unknown
-          }>
-          const firstValue = items[0]?.value
-          const sourceTime = Array.isArray(firstValue) ? Number(firstValue[2] ?? 0) : 0
-          return [
-            sourceTime ? formatTime(sourceTime) : '--:--:--',
-            ...items.map((item) => {
-              const amount = chartAmount(item.value)
-              return `${item.seriesName ?? ''}  ${amount >= 0 ? '+' : ''}${amount.toFixed(2)}亿元`
-            }),
-          ].join('\n')
-        },
-      },
+      tooltip: { show: false },
       xAxis: {
         type: 'value',
         min: 0,
@@ -1601,8 +1651,10 @@ export default function SectorFlowPage() {
 
   useEffect(() => {
     chartOptionRef.current = chartOption
-    chartRef.current?.setOption(chartOption, { notMerge: true, lazyUpdate: true })
-  }, [chartOption])
+    chartRef.current?.setOption(chartOption, { notMerge: true })
+    highlightedCodeRef.current = null
+    highlightSector(hoveredCodeRef.current ?? pinnedCodeRef.current)
+  }, [chartOption, highlightSector])
 
   useEffect(() => {
     if (chartMode !== 'main') return
@@ -1810,6 +1862,38 @@ export default function SectorFlowPage() {
 
             <div className={chartMode === 'main' ? 'relative h-[480px] min-h-[420px] w-full sm:h-[560px] lg:h-[640px]' : 'hidden'}>
                 <div ref={chartContainer} className="absolute inset-0" aria-label="行业主力资金实时曲线" />
+                {!loading && history.series.length > 0 && (
+                  <div className="pointer-events-none absolute left-[76px] top-2 z-10 flex max-w-[calc(100%-90px)] flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-slate-200 bg-white/95 px-3 py-1.5 text-xs shadow-sm backdrop-blur-sm sm:left-[150px] sm:max-w-[calc(100%-164px)] dark:border-slate-700 dark:bg-slate-900/95">
+                    {focusedSector ? (
+                      <>
+                        <span className="text-slate-500">
+                          {focusedCode === pinnedCode ? '已固定' : '当前曲线'}
+                        </span>
+                        <strong className="text-sm text-slate-900 dark:text-slate-100">
+                          {displayName(focusedSector.sector_name)}
+                        </strong>
+                        <span className={focusedLatest >= 0 ? 'font-mono text-red-600' : 'font-mono text-emerald-600'}>
+                          最新 {formatYi(focusedLatest)}
+                        </span>
+                      </>
+                    ) : (
+                      <span className="text-slate-500">悬停曲线或右侧板块名称查看，点击固定</span>
+                    )}
+                    {pinnedCode && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          pinnedCodeRef.current = null
+                          setPinnedCode(null)
+                          highlightSector(hoveredCodeRef.current)
+                        }}
+                        className="pointer-events-auto rounded px-1.5 py-0.5 font-medium text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
+                      >
+                        取消固定
+                      </button>
+                    )}
+                  </div>
+                )}
                 {loading && (
                   <div className="absolute inset-0 flex items-center justify-center bg-white/70 text-sm text-slate-500 backdrop-blur-sm dark:bg-slate-900/70">
                     <Radio className="mr-2 size-4 animate-pulse" />正在加载今日资金数据…
