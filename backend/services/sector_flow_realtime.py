@@ -20,7 +20,6 @@ from config import (
     env_path,
 )
 from services.sector_flow_upstream import (
-    build_eastmoney_params,
     fetch_all_industry_sectors,
     fetch_sector_daily_data,
     fetch_sector_minute_data,
@@ -471,28 +470,33 @@ class SectorFlowRealtimeService:
 
     async def _fetch_snapshot(self) -> list[dict[str, Any]] | None:
         secids = ",".join(f"90.{sector['code']}" for sector in self._selection)
-        params = build_eastmoney_params({
+        params = {
+            "np": "1",
+            "fltt": "2",
+            "invt": "2",
             "secids": secids,
             "fields": "f12,f14,f62,f66,f72,f78,f84,f124",
-        })
-        text = await safe_fetch(
+        }
+        for url in (
             EASTMONEY_SECTOR_FLOW_SNAPSHOT_URL,
-            params=params,
-            headers={"Referer": "https://data.eastmoney.com/"},
-        )
-        if not text:
+            EASTMONEY_SECTOR_FLOW_SNAPSHOT_FALLBACK_URL,
+        ):
             text = await safe_fetch(
-                EASTMONEY_SECTOR_FLOW_SNAPSHOT_FALLBACK_URL,
+                url,
                 params=params,
                 headers={"Referer": "https://data.eastmoney.com/"},
             )
-        if not text:
-            return None
-        try:
-            payload = json.loads(text)
-        except json.JSONDecodeError:
-            return None
-        return parse_snapshot_items((payload.get("data") or {}).get("diff") or [])
+            if not text:
+                continue
+            try:
+                payload = json.loads(text)
+                items = (payload.get("data") or {}).get("diff") or []
+                flows = parse_snapshot_items(items) if isinstance(items, list) else []
+            except (AttributeError, json.JSONDecodeError):
+                continue
+            if flows:
+                return flows
+        return None
 
     def _schedule_minute_backfill(
         self,
@@ -684,7 +688,14 @@ class SectorFlowRealtimeService:
             return False
         flows = await self._fetch_snapshot()
         if not flows:
-            await self._set_status("error", "板块资金快照请求失败")
+            recent = self._last_source_time is not None and (
+                0 <= current.timestamp() - self._last_source_time
+                < max(30.0, self.poll_seconds * 10)
+            )
+            await self._set_status(
+                "open" if recent else "error",
+                None if recent else "板块资金快照请求失败",
+            )
             return False
 
         selected_codes = {sector["code"] for sector in self._selection}
@@ -713,7 +724,7 @@ class SectorFlowRealtimeService:
         )
         if signature == self._last_signature:
             source_time = max(int(flow["source_time"]) for flow in valid_flows)
-            delayed = current.timestamp() - source_time > max(10.0, self.poll_seconds * 3)
+            delayed = current.timestamp() - source_time > max(30.0, self.poll_seconds * 10)
             await self._set_status(
                 "stale" if delayed else "open",
                 "上游板块资金快照更新延迟" if delayed else None,
@@ -732,8 +743,8 @@ class SectorFlowRealtimeService:
         self._last_source_time = max(int(flow["source_time"]) for flow in valid_flows)
         self._last_received_at = received_at
         delayed = current.timestamp() - self._last_source_time > max(
-            10.0,
-            self.poll_seconds * 3,
+            30.0,
+            self.poll_seconds * 10,
         )
         self._last_error = "上游板块资金快照更新延迟" if delayed else None
         self._status = "stale" if delayed else "open"

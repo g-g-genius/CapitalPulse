@@ -1847,7 +1847,7 @@ export default function SectorFlowPage() {
   const isDelayed = history.status.market_status === 'stale'
     || (history.status.market_status === 'open'
       && !!history.status.last_source_time
-      && Date.now() / 1000 - history.status.last_source_time > 10)
+      && Date.now() / 1000 - history.status.last_source_time > 30)
 
   return (
     <main className="min-h-screen bg-slate-50 text-slate-950 dark:bg-slate-950 dark:text-slate-100">
@@ -1863,7 +1863,7 @@ export default function SectorFlowPage() {
         {(loadError || activeViewError || isDelayed || history.status.last_error || history.status.backfill_error) && (
           <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300">
             <CircleAlert className="mt-0.5 size-4 shrink-0" />
-            <span>{loadError || activeViewError || history.status.last_error || history.status.backfill_error || '数据源更新时间超过10秒，曲线可能暂时停滞。'}</span>
+            <span>{loadError || activeViewError || history.status.last_error || history.status.backfill_error || '数据源更新时间超过30秒，曲线可能暂时停滞。'}</span>
           </div>
         )}
 
