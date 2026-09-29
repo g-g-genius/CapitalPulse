@@ -2,6 +2,7 @@ import json
 import unittest
 from unittest.mock import AsyncMock, patch
 
+import services.sector_stock_candidates as candidate_service
 from services.sector_stock_candidates import (
     fetch_sector_stock_candidates,
     rank_sector_stocks,
@@ -19,6 +20,9 @@ def quote(code="000001", name="平安银行", **changes):
 
 
 class SectorStockCandidateTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        candidate_service._candidate_cache.clear()
+
     def test_only_liquid_positive_inflow_constituents_are_ranked(self):
         items = [
             quote("000001", f62=10_000_000),
@@ -41,8 +45,20 @@ class SectorStockCandidateTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["as_of"], 1780123456)
         self.assertEqual(len(result["candidates"]), 2)
         self.assertEqual(fetch.await_args.kwargs["params"]["fs"], "b:BK1033+f:!50")
-        self.assertEqual(fetch.await_args.kwargs["params"]["fid"], "f62")
-        self.assertEqual(fetch.await_args.kwargs["params"]["pz"], "40")
+        self.assertEqual(fetch.await_args.kwargs["params"]["fid"], "f6")
+        self.assertEqual(fetch.await_args.kwargs["params"]["pz"], "20")
+        self.assertEqual(result["scanned_constituents"], 2)
+
+    async def test_recent_success_is_used_if_upstream_temporarily_fails(self):
+        payload = json.dumps({"data": {"total": 1, "diff": [quote()]}})
+        with patch("services.sector_stock_candidates.safe_fetch", new=AsyncMock(return_value=payload)):
+            await fetch_sector_stock_candidates("BK1033")
+        created, data = candidate_service._candidate_cache[("BK1033", 5)]
+        candidate_service._candidate_cache[("BK1033", 5)] = (created - 61, data)
+        with patch("services.sector_stock_candidates.safe_fetch", new=AsyncMock(return_value=None)):
+            result = await fetch_sector_stock_candidates("BK1033")
+        self.assertTrue(result["stale"])
+        self.assertEqual(result["candidates"][0]["code"], "000001")
 
     async def test_invalid_sector_code_does_not_call_upstream(self):
         with patch("services.sector_stock_candidates.safe_fetch", new=AsyncMock()) as fetch:
