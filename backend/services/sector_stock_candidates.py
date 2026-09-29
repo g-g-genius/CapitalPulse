@@ -5,10 +5,10 @@ from __future__ import annotations
 import json
 import math
 import re
+import time
 from typing import Any
 
 from config import EASTMONEY_PUSH_URL, EASTMONEY_SECTOR_URL
-from services.sector_flow_upstream import build_eastmoney_params
 from utils.http_client import safe_fetch
 
 SECTOR_CODE_PATTERN = re.compile(r"^BK\d{4}$")
@@ -16,6 +16,9 @@ STOCK_FIELDS = "f2,f3,f6,f8,f10,f12,f13,f14,f62,f124"
 MIN_AMOUNT = 100_000_000
 MIN_TURNOVER_RATE = 1.0
 MAX_CHANGE_PERCENT = 8.0
+FRESH_CACHE_SECONDS = 60
+STALE_CACHE_SECONDS = 600
+_candidate_cache: dict[tuple[str, int], tuple[float, dict[str, Any]]] = {}
 
 
 def _number(value: Any) -> float | None:
@@ -97,19 +100,28 @@ async def fetch_sector_stock_candidates(
     if not SECTOR_CODE_PATTERN.fullmatch(sector_code):
         return None
 
-    page_size = 40
+    cache_key = (sector_code, limit)
+    cached = _candidate_cache.get(cache_key)
+    cache_age = time.monotonic() - cached[0] if cached else None
+    if cached and cache_age is not None and cache_age < FRESH_CACHE_SECONDS:
+        return {**cached[1], "stale": False}
+
+    page_size = 20
     items: list[Any] = []
     total = 0
     for page in range(1, 31):
-        params = build_eastmoney_params({
+        params = {
             "pn": str(page),
             "pz": str(page_size),
             "po": "1",
-            "fid": "f62",
+            "np": "1",
+            "fltt": "2",
+            "invt": "2",
+            "fid": "f6",
             "fs": f"b:{sector_code}+f:!50",
             "fields": STOCK_FIELDS,
-        })
-        text = None
+        }
+        data = None
         for url in (
             EASTMONEY_PUSH_URL,
             "https://29.push2.eastmoney.com/api/qt/clist/get",
@@ -120,20 +132,28 @@ async def fetch_sector_stock_candidates(
                 params=params,
                 headers={"Referer": "https://data.eastmoney.com/"},
             )
-            if text:
+            if not text:
+                continue
+            try:
+                payload = json.loads(text)
+                if payload.get("rc") not in (None, 0):
+                    continue
+                parsed = payload.get("data")
+                if isinstance(parsed, dict) and isinstance(parsed.get("diff") or [], list):
+                    data = parsed
+                    break
+            except (ValueError, TypeError, AttributeError):
+                continue
+        if data is None:
+            if items:
                 break
-        if not text:
+            if cached and cache_age is not None and cache_age < STALE_CACHE_SECONDS:
+                return {**cached[1], "stale": True}
             return None
         try:
-            payload = json.loads(text)
-            data = payload.get("data")
-            if not isinstance(data, dict):
-                return None
             page_items = data.get("diff") or []
             total = int(data.get("total") or 0)
-        except (ValueError, TypeError, AttributeError):
-            return None
-        if not isinstance(page_items, list):
+        except (ValueError, TypeError):
             return None
         items.extend(page_items)
         if (
@@ -149,9 +169,13 @@ async def fetch_sector_stock_candidates(
         for item in items if isinstance(item, dict)
         and str(item.get("f124") or "").isdigit()
     ]
-    return {
+    result = {
         "sector_code": sector_code,
         "as_of": max(source_times, default=None),
         "total_constituents": total,
+        "scanned_constituents": len(items),
         "candidates": candidates,
+        "stale": False,
     }
+    _candidate_cache[cache_key] = (time.monotonic(), result)
+    return result
