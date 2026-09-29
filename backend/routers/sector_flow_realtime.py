@@ -5,8 +5,25 @@ from datetime import date, datetime
 from fastapi import APIRouter, Query
 
 from services.sector_flow_realtime import CST, sector_flow_service
+from services.sector_stock_candidates import (
+    SECTOR_CODE_PATTERN,
+    fetch_sector_stock_candidates,
+)
 
 router = APIRouter()
+
+
+@router.get("/sector-flow/candidates")
+async def get_sector_stock_candidates(
+    sector_code: str = Query(..., description="EastMoney industry sector code"),
+    limit: int = Query(5, ge=1, le=8),
+):
+    if not SECTOR_CODE_PATTERN.fullmatch(sector_code):
+        return {"code": 400, "msg": "invalid sector code", "data": None}
+    data = await fetch_sector_stock_candidates(sector_code, limit)
+    if data is None:
+        return {"code": 502, "msg": "sector constituent quotes are unavailable", "data": None}
+    return {"code": 200, "msg": "success", "data": data}
 
 
 @router.get("/sector-flow/history")

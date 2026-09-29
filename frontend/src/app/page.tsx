@@ -97,6 +97,23 @@ type StockSearchResult = {
   pinyin: string
 }
 
+type SectorStockCandidate = StockSearchResult & {
+  price: number
+  change_percent: number
+  amount: number
+  turnover_rate: number
+  main_net: number
+  volume_ratio: number | null
+  source_time: number
+}
+
+type SectorCandidateData = {
+  sector_code: string
+  as_of: number | null
+  total_constituents: number
+  candidates: SectorStockCandidate[]
+}
+
 const DEFAULT_STOCK: StockSearchResult = {
   quote_id: '0.000001',
   code: '000001',
@@ -326,6 +343,14 @@ function chartAmount(value: unknown): number {
 
 function formatYi(value: number, digits = 2): string {
   return `${value >= 0 ? '+' : ''}${(value / 1e8).toFixed(digits)}亿`
+}
+
+function formatQuoteDateTime(timestamp: number | null): string {
+  if (!timestamp) return '暂无时间'
+  return new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai',
+    month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit',
+  }).format(new Date(timestamp * 1000))
 }
 
 function displayName(value: string): string {
@@ -1028,6 +1053,10 @@ export default function SectorFlowPage() {
   const [chartMode, setChartMode] = useState<ChartMode>('main')
   const [hoveredCode, setHoveredCode] = useState<string | null>(null)
   const [pinnedCode, setPinnedCode] = useState<string | null>(null)
+  const [candidateData, setCandidateData] = useState<SectorCandidateData | null>(null)
+  const [candidateLoading, setCandidateLoading] = useState(false)
+  const [candidateError, setCandidateError] = useState<string | null>(null)
+  const [candidateRefresh, setCandidateRefresh] = useState(0)
   const [detailPage, setDetailPage] = useState(1)
   const [detailPages, setDetailPages] = useState<Record<number, DetailHistoryPage>>({})
   const [detailLoadingPage, setDetailLoadingPage] = useState<number | null>(null)
@@ -1469,11 +1498,14 @@ export default function SectorFlowPage() {
 
   useEffect(() => {
     let disposed = false
+    let observer: ResizeObserver | null = null
     void import('echarts').then((echarts) => {
       if (disposed || !chartContainer.current) return
       const chart = echarts.init(chartContainer.current, undefined, { renderer: 'canvas' })
       chartRef.current = chart
       chart.setOption(chartOptionRef.current, { notMerge: true, lazyUpdate: true })
+      observer = new ResizeObserver(() => chart.resize())
+      observer.observe(chartContainer.current)
 
       const eventCode = (params: { seriesId?: string; seriesIndex?: number }) => {
         const optionSeries = chartOptionRef.current.series
@@ -1511,6 +1543,7 @@ export default function SectorFlowPage() {
     window.addEventListener('resize', resize)
     return () => {
       disposed = true
+      observer?.disconnect()
       window.removeEventListener('resize', resize)
       chartRef.current?.dispose()
       chartRef.current = null
@@ -1531,6 +1564,29 @@ export default function SectorFlowPage() {
       highlightSector(hoveredCodeRef.current)
     }
   }, [highlightSector, visibleCodes])
+  useEffect(() => {
+    if (chartMode !== 'main' || !pinnedCode) return
+    const controller = new AbortController()
+    const sectorCode = pinnedCode
+    setCandidateData(null)
+    setCandidateError(null)
+    setCandidateLoading(true)
+    void fetch(`/api/finance/sector-flow/candidates?sector_code=${encodeURIComponent(sectorCode)}&limit=5`, {
+      signal: controller.signal,
+    }).then(async (response) => {
+      if (!response.ok) throw new Error('请求失败')
+      const payload = await response.json() as { code: number; data: SectorCandidateData | null }
+      if (payload.code !== 200 || !payload.data) throw new Error('行情暂不可用')
+      setCandidateData(payload.data)
+    }).catch((error: unknown) => {
+      if (!controller.signal.aborted) {
+        setCandidateError(error instanceof Error ? error.message : '请求失败')
+      }
+    }).finally(() => {
+      if (!controller.signal.aborted) setCandidateLoading(false)
+    })
+    return () => controller.abort()
+  }, [chartMode, pinnedCode, candidateRefresh])
   const visibleLatest = useMemo(
     () => history.latest.filter((item) => visibleCodes.has(item.sector_code)),
     [history.latest, visibleCodes],
@@ -1542,6 +1598,9 @@ export default function SectorFlowPage() {
   const focusedCode = hoveredCode ?? pinnedCode
   const focusedSector = focusedCode
     ? history.series.find((item) => item.sector_code === focusedCode)
+    : null
+  const pinnedSector = pinnedCode
+    ? history.series.find((item) => item.sector_code === pinnedCode)
     : null
   const focusedLatest = focusedSector
     ? latestByCode.get(focusedSector.sector_code)?.main_net ?? focusedSector.points.at(-1)?.[1] ?? 0
@@ -1932,7 +1991,8 @@ export default function SectorFlowPage() {
               </div>
             </div>
 
-            <div className={chartMode === 'main' ? 'relative h-[480px] min-h-[420px] w-full sm:h-[560px] lg:h-[640px]' : 'hidden'}>
+            <div className={chartMode === 'main' ? 'flex min-h-[480px] flex-col xl:flex-row' : 'hidden'}>
+              <div className="relative h-[480px] min-h-[420px] min-w-0 flex-1 sm:h-[560px] lg:h-[640px]">
                 <div ref={chartContainer} className="absolute inset-0" aria-label="行业主力资金实时曲线" />
                 {!loading && history.series.length > 0 && (
                   <div className="pointer-events-none absolute left-[76px] top-2 z-10 flex max-w-[calc(100%-90px)] flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-slate-200 bg-white/95 px-3 py-1.5 text-xs shadow-sm backdrop-blur-sm sm:left-[150px] sm:max-w-[calc(100%-164px)] dark:border-slate-700 dark:bg-slate-900/95">
@@ -1976,6 +2036,63 @@ export default function SectorFlowPage() {
                     当前还没有今日快照，开盘后将自动开始绘制。
                   </div>
                 )}
+              </div>
+              {pinnedCode && (
+                <aside className="flex max-h-[640px] flex-col border-t border-slate-200 bg-slate-50/80 xl:w-[300px] xl:shrink-0 xl:border-l xl:border-t-0 dark:border-slate-800 dark:bg-slate-950/50" aria-label={`${displayName(pinnedSector?.sector_name ?? '板块')}短线活跃候选`}>
+                  <div className="border-b border-slate-200 px-4 py-3 dark:border-slate-800">
+                    <div className="flex items-start justify-between gap-2">
+                      <div>
+                        <div className="text-xs text-slate-500">{displayName(pinnedSector?.sector_name ?? pinnedCode)}</div>
+                        <h3 className="mt-0.5 text-sm font-semibold text-slate-900 dark:text-slate-100">短线活跃候选</h3>
+                      </div>
+                      <button type="button" onClick={() => setCandidateRefresh((value) => value + 1)} className="rounded-md px-2 py-1 text-xs text-slate-500 hover:bg-slate-200 dark:hover:bg-slate-800">刷新</button>
+                    </div>
+                    <p className="mt-1 text-[11px] leading-4 text-slate-500">
+                      {candidateData?.sector_code === pinnedCode
+                        ? `东方财富 · ${formatQuoteDateTime(candidateData.as_of)} · 成分股 ${candidateData.total_constituents} 只`
+                        : '按板块成分股最新行情筛选'}
+                    </p>
+                  </div>
+                  <div className="min-h-0 flex-1 space-y-2 overflow-y-auto p-3">
+                    {candidateLoading && <div className="py-8 text-center text-xs text-slate-500">正在筛选成分股…</div>}
+                    {!candidateLoading && candidateError && (
+                      <div className="py-8 text-center text-xs text-amber-600">候选加载失败：{candidateError}</div>
+                    )}
+                    {!candidateLoading && !candidateError && candidateData?.sector_code === pinnedCode && candidateData.candidates.length === 0 && (
+                      <div className="py-8 text-center text-xs text-slate-500">当前没有满足条件的成分股</div>
+                    )}
+                    {!candidateLoading && !candidateError && candidateData?.sector_code === pinnedCode && candidateData.candidates.map((stock, index) => (
+                      <button
+                        key={stock.quote_id}
+                        type="button"
+                        onClick={() => { chooseStock(stock); setChartMode('stock') }}
+                        className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2.5 text-left transition-colors hover:border-slate-400 hover:bg-slate-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-500 dark:border-slate-700 dark:bg-slate-900 dark:hover:border-slate-500"
+                        aria-label={`查看${stock.name}个股资金曲线`}
+                      >
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="min-w-0 truncate text-sm font-semibold text-slate-900 dark:text-slate-100"><span className="mr-1.5 text-xs font-normal text-slate-400">{index + 1}.</span>{stock.name}</span>
+                          <span className="shrink-0 font-mono text-xs text-slate-500">{stock.code}</span>
+                        </div>
+                        <div className="mt-1.5 flex items-center justify-between gap-2 text-xs">
+                          <span className="font-mono text-slate-700 dark:text-slate-300">¥{stock.price.toFixed(2)}</span>
+                          <span className="font-mono font-medium text-red-600">+{stock.change_percent.toFixed(2)}%</span>
+                        </div>
+                        <div className="mt-1 flex flex-wrap gap-x-2 text-[11px] text-slate-500">
+                          <span>主力 {formatYi(stock.main_net)}</span>
+                          <span>换手 {stock.turnover_rate.toFixed(1)}%</span>
+                        </div>
+                        <div className="mt-0.5 flex flex-wrap gap-x-2 text-[11px] text-slate-500">
+                          <span>成交 {(stock.amount / 1e8).toFixed(1)}亿</span>
+                          {stock.volume_ratio && <span>量比 {stock.volume_ratio.toFixed(1)}</span>}
+                        </div>
+                      </button>
+                    ))}
+                  </div>
+                  <p className="border-t border-slate-200 px-3 py-2 text-[11px] leading-4 text-slate-500 dark:border-slate-800">
+                    筛选：成交额≥1亿、换手≥1%、涨幅 0–8%、主力净流入为正；排除 ST。仅供观察，不构成买卖建议。A股当日买入通常次日才能卖出。
+                  </p>
+                </aside>
+              )}
             </div>
 
             {chartMode === 'detail' && (
