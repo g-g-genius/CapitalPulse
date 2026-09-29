@@ -8,6 +8,7 @@ import json
 import logging
 import os
 import sqlite3
+from collections import deque
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -28,7 +29,6 @@ from utils.http_client import safe_fetch
 from utils.sector_selection import (
     as_float,
     filter_second_level_industries,
-    select_top_sectors,
 )
 
 logger = logging.getLogger(__name__)
@@ -54,6 +54,8 @@ AFTERNOON_START = time(13, 0)
 AFTERNOON_END = time(15, 0)
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "sector_flow_realtime.sqlite3"
 DETAIL_PAGE_SIZE = 6
+SNAPSHOT_DELAY_SECONDS = 10.0
+SNAPSHOT_ALERT_SECONDS = 30.0
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -141,7 +143,12 @@ class SectorFlowRealtimeService:
         self._daily_refresh_retry_at = 0.0
         self._clients: set[WebSocket] = set()
         self._selection: list[dict[str, Any]] = []
+        self._universe: list[dict[str, Any]] = []
+        self._universe_retry_at = 0.0
         self._selection_date: date | None = None
+        self._radar_samples: dict[str, deque[tuple[int, float]]] = {}
+        self._positive_turns: dict[str, int] = {}
+        self._radar: dict[str, Any] = {"source_time": None, "scanned_count": 0, "sectors": []}
         self._latest: dict[str, dict[str, Any]] = {}
         self._last_signature: tuple[Any, ...] | None = None
         self._status = "closed"
@@ -207,6 +214,14 @@ class SectorFlowRealtimeService:
                 sector_name TEXT NOT NULL,
                 market_cap REAL NOT NULL,
                 selected_at TEXT NOT NULL,
+                PRIMARY KEY (trade_date, sector_code)
+            );
+
+            CREATE TABLE IF NOT EXISTS sector_flow_universe (
+                trade_date TEXT NOT NULL,
+                sector_code TEXT NOT NULL,
+                sector_name TEXT NOT NULL,
+                market_cap REAL NOT NULL,
                 PRIMARY KEY (trade_date, sector_code)
             );
 
@@ -308,6 +323,10 @@ class SectorFlowRealtimeService:
         sectors: list[dict[str, Any]],
     ) -> None:
         selected_at = datetime.now(CST).isoformat(timespec="seconds")
+        self.connection.execute(
+            "DELETE FROM sector_flow_selection WHERE trade_date = ?",
+            (trade_date.isoformat(),),
+        )
         self.connection.executemany(
             """
             INSERT INTO sector_flow_selection
@@ -333,6 +352,30 @@ class SectorFlowRealtimeService:
         )
         self.connection.commit()
 
+    def _load_universe(self, trade_date: date) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT sector_code, sector_name, market_cap FROM sector_flow_universe WHERE trade_date = ?",
+            (trade_date.isoformat(),),
+        ).fetchall()
+        return [
+            {"code": str(code), "name": str(name), "market_cap": float(cap), "sector_type": "industry"}
+            for code, name, cap in rows
+        ]
+
+    def _save_universe(self, trade_date: date, sectors: list[dict[str, Any]]) -> None:
+        self.connection.execute(
+            "DELETE FROM sector_flow_universe WHERE trade_date = ?",
+            (trade_date.isoformat(),),
+        )
+        self.connection.executemany(
+            "INSERT INTO sector_flow_universe VALUES (?, ?, ?, ?)",
+            [
+                (trade_date.isoformat(), sector["code"], sector["name"], as_float(sector.get("market_cap")))
+                for sector in sectors
+            ],
+        )
+        self.connection.commit()
+
     def _reset_backfill_for_date(self, trade_date: date) -> None:
         if self._backfill_date == trade_date:
             return
@@ -342,47 +385,54 @@ class SectorFlowRealtimeService:
         self._backfill_error = None
         self._backfill_retry_at = 0.0
 
-    async def _ensure_selection(self, trade_date: date) -> bool:
-        if self._selection_date == trade_date and len(self._selection) == 30:
+    async def _ensure_selection(self, trade_date: date, *, allow_fetch: bool = True) -> bool:
+        loop = asyncio.get_running_loop()
+        if self._selection_date == trade_date and self._universe:
+            return True
+        if self._selection_date == trade_date and not allow_fetch:
+            return True
+        if self._selection_date == trade_date and loop.time() < self._universe_retry_at:
             return True
 
-        self._cleanup_old_data(trade_date)
-        stored = self._load_selection(trade_date)
-        if len(stored) == 30:
+        new_day = self._selection_date != trade_date
+        if new_day:
+            self._cleanup_old_data(trade_date)
+        stored = self._load_selection(trade_date) if new_day else self._selection
+        universe = self._load_universe(trade_date)
+        if not universe and allow_fetch:
+            sectors = await fetch_all_industry_sectors()
+            if sectors is not None:
+                universe = filter_second_level_industries([
+                    {**sector, "sector_type": "industry"} for sector in sectors
+                ])
+                if len(universe) >= 100:
+                    self._save_universe(trade_date, universe)
+                else:
+                    logger.warning("[sector-flow] Industry universe incomplete: %d sectors", len(universe))
+                    universe = []
+            if not universe:
+                self._universe_retry_at = loop.time() + 60.0
+        if not universe and not stored:
+            if allow_fetch:
+                await self._set_status("error", "无法获取行业板块列表")
+            else:
+                self._selection_date = trade_date
+                self._selection = []
+                self._universe = []
+            return False
+        self._universe = universe
+        if new_day:
             self._selection = stored
-            self._selection_date = trade_date
-            self._reset_backfill_for_date(trade_date)
-            self._load_latest(trade_date)
-            await self.broadcast(self.snapshot_message())
-            return True
-
-        sectors = await fetch_all_industry_sectors()
-        if sectors is None:
-            await self._set_status("error", "无法获取行业板块列表")
-            return False
-        candidates = filter_second_level_industries([
-            {**sector, "sector_type": "industry"}
-            for sector in sectors
-        ])
-        selected = select_top_sectors(candidates, 30)
-        if len(selected) != 30:
-            await self._set_status(
-                "error",
-                f"仅获取到 {len(selected)} 个申万二级行业，无法选出 Top 30",
-            )
-            return False
-
-        self._save_selection(trade_date, selected)
-        self._selection = [
-            {**sector, "rank": rank}
-            for rank, sector in enumerate(selected, start=1)
-        ]
         self._selection_date = trade_date
-        self._reset_backfill_for_date(trade_date)
-        self._latest.clear()
-        self._last_signature = None
-        self._cleanup_old_data(trade_date)
-        await self.broadcast(self.snapshot_message())
+        if new_day:
+            self._reset_backfill_for_date(trade_date)
+            self._radar_samples.clear()
+            self._positive_turns.clear()
+            self._radar = {"source_time": None, "scanned_count": 0, "sectors": []}
+            self._load_latest(trade_date)
+            self._last_signature = None
+        if new_day or universe:
+            await self.broadcast(self.snapshot_message())
         return True
 
     def _cleanup_daily_cache(self) -> None:
@@ -420,6 +470,10 @@ class SectorFlowRealtimeService:
         )
         self.connection.execute(
             "DELETE FROM sector_flow_selection WHERE trade_date < ?",
+            (cutoff,),
+        )
+        self.connection.execute(
+            "DELETE FROM sector_flow_universe WHERE trade_date < ?",
             (cutoff,),
         )
         self._cleanup_daily_cache()
@@ -469,7 +523,7 @@ class SectorFlowRealtimeService:
         self._last_received_at = str(latest_row[8])
 
     async def _fetch_snapshot(self) -> list[dict[str, Any]] | None:
-        secids = ",".join(f"90.{sector['code']}" for sector in self._selection)
+        secids = ",".join(f"90.{sector['code']}" for sector in (self._universe or self._selection))
         params = {
             "np": "1",
             "fltt": "2",
@@ -507,6 +561,7 @@ class SectorFlowRealtimeService:
             now.weekday() >= 5
             or now.timetz().replace(tzinfo=None) <= MORNING_START
             or self._selection_date != now.date()
+            or not self._universe
             or len(self._selection) != 30
             or self._backfill_status == "complete"
             or monotonic_now < self._backfill_retry_at
@@ -681,6 +736,57 @@ class SectorFlowRealtimeService:
         )
         self.connection.commit()
 
+    @staticmethod
+    def _rank_flows(flows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        positive = sorted(
+            (flow for flow in flows if flow["main_net"] > 0),
+            key=lambda flow: (-flow["main_net"], flow["sector_code"]),
+        )[:15]
+        negative = sorted(
+            (flow for flow in flows if flow["main_net"] < 0),
+            key=lambda flow: (flow["main_net"], flow["sector_code"]),
+        )[:15]
+        return positive + negative
+
+    def _update_radar(self, flows: list[dict[str, Any]], source_time: int) -> None:
+        sectors: list[dict[str, Any]] = []
+        for flow in flows:
+            code = flow["sector_code"]
+            samples = self._radar_samples.setdefault(code, deque())
+            if samples and source_time <= samples[-1][0]:
+                continue
+            previous = samples[-1] if samples else None
+            samples.append((source_time, flow["main_net"]))
+            if previous is not None and previous[1] <= 0 < flow["main_net"]:
+                self._positive_turns[code] = source_time
+            while samples and source_time - samples[0][0] > 240:
+                samples.popleft()
+
+            def change(seconds: int) -> float | None:
+                reference = next(
+                    (value for stamp, value in reversed(samples) if stamp <= source_time - seconds),
+                    None,
+                )
+                return round(flow["main_net"] - reference, 2) if reference is not None else None
+
+            sectors.append({
+                "sector_code": code,
+                "sector_name": flow["sector_name"],
+                "main_net": flow["main_net"],
+                "change_15s": change(15),
+                "change_1m": change(60),
+                "change_3m": change(180),
+                "turned_positive": flow["main_net"] > 0 and source_time - self._positive_turns.get(code, 0) <= 300,
+                "turn_time": self._positive_turns.get(code),
+                "source_time": source_time,
+                "points": list(samples),
+            })
+        self._radar = {
+            "source_time": source_time,
+            "scanned_count": len(flows),
+            "sectors": sectors,
+        }
+
     async def collect_once(self, now: datetime | None = None) -> bool:
         """Fetch, persist, and then broadcast one batch. Exposed for tests."""
         current = now or datetime.now(CST)
@@ -688,18 +794,20 @@ class SectorFlowRealtimeService:
             return False
         flows = await self._fetch_snapshot()
         if not flows:
-            recent = self._last_source_time is not None and (
-                0 <= current.timestamp() - self._last_source_time
-                < max(30.0, self.poll_seconds * 10)
+            source_age = (
+                current.timestamp() - self._last_source_time
+                if self._last_source_time is not None else None
             )
+            recent = source_age is not None and 0 <= source_age < SNAPSHOT_ALERT_SECONDS
             await self._set_status(
-                "open" if recent else "error",
+                ("stale" if source_age > SNAPSHOT_DELAY_SECONDS else "open") if recent else "error",
                 None if recent else "板块资金快照请求失败",
             )
             return False
 
-        selected_codes = {sector["code"] for sector in self._selection}
-        flows = [flow for flow in flows if flow["sector_code"] in selected_codes]
+        universe = self._universe or self._selection
+        universe_by_code = {sector["code"]: sector for sector in universe}
+        flows = [flow for flow in flows if flow["sector_code"] in universe_by_code]
         if not flows:
             await self._set_status("error", "板块资金快照为空")
             return False
@@ -713,6 +821,20 @@ class SectorFlowRealtimeService:
             await self._set_status("stale", "上游尚未提供当天板块资金快照")
             return False
 
+        # A partial upstream response must not silently replace the ranking.
+        if self._universe and len(valid_flows) < max(1, int(len(self._universe) * 0.9)):
+            await self._set_status("stale", "板块资金快照不完整，等待下一次刷新")
+            return False
+
+        latest_source_time = max(int(flow["source_time"]) for flow in valid_flows)
+        valid_flows = [
+            flow for flow in valid_flows
+            if latest_source_time - int(flow["source_time"]) <= SNAPSHOT_DELAY_SECONDS
+        ]
+        if self._universe and len(valid_flows) < max(1, int(len(self._universe) * 0.9)):
+            await self._set_status("stale", "板块资金快照时间不一致，等待下一次刷新")
+            return False
+
         received_at = datetime.now(CST).isoformat(timespec="milliseconds")
         signature = tuple(
             (
@@ -724,29 +846,53 @@ class SectorFlowRealtimeService:
         )
         if signature == self._last_signature:
             source_time = max(int(flow["source_time"]) for flow in valid_flows)
-            delayed = current.timestamp() - source_time > max(30.0, self.poll_seconds * 10)
+            source_age = current.timestamp() - source_time
+            delayed = source_age > SNAPSHOT_DELAY_SECONDS
             await self._set_status(
                 "stale" if delayed else "open",
-                "上游板块资金快照更新延迟" if delayed else None,
+                "上游板块资金快照更新延迟"
+                if source_age > SNAPSHOT_ALERT_SECONDS else None,
             )
             return False
 
-        # Persist first so reconnecting clients can always backfill a broadcast.
-        self._persist_snapshot(current.date(), valid_flows, received_at)
+        ranked = self._rank_flows(valid_flows) if self._universe else valid_flows
+        next_selection = [
+            {**universe_by_code[flow["sector_code"]], "rank": rank}
+            for rank, flow in enumerate(ranked, start=1)
+        ] if self._universe else self._selection
+        previous_codes = [sector["code"] for sector in self._selection]
+        next_codes = [sector["code"] for sector in next_selection]
+        if next_codes != previous_codes:
+            self._save_selection(current.date(), next_selection)
+            self._selection = next_selection
+
+        # Keep full-resolution curves for visible sectors and one sample per minute
+        # for the rest, so a newly ranked sector still has a useful intraday curve.
+        selected_codes = set(next_codes)
+        rows_to_persist = [
+            flow for flow in valid_flows
+            if flow["sector_code"] in selected_codes
+            or self._latest.get(flow["sector_code"], {}).get("source_time", 0) // 60
+                < int(flow["source_time"]) // 60
+        ]
+        self._persist_snapshot(current.date(), rows_to_persist, received_at)
         broadcast_flows = [
             {**flow, "granularity": "realtime"}
             for flow in valid_flows
         ]
         for flow in broadcast_flows:
             self._latest[flow["sector_code"]] = {**flow, "received_at": received_at}
+        if self._universe:
+            self._update_radar(valid_flows, latest_source_time)
         self._last_signature = signature
         self._last_source_time = max(int(flow["source_time"]) for flow in valid_flows)
         self._last_received_at = received_at
-        delayed = current.timestamp() - self._last_source_time > max(
-            30.0,
-            self.poll_seconds * 10,
+        source_age = current.timestamp() - self._last_source_time
+        delayed = source_age > SNAPSHOT_DELAY_SECONDS
+        self._last_error = (
+            "上游板块资金快照更新延迟"
+            if source_age > SNAPSHOT_ALERT_SECONDS else None
         )
-        self._last_error = "上游板块资金快照更新延迟" if delayed else None
         self._status = "stale" if delayed else "open"
 
         await self.broadcast({
@@ -754,8 +900,11 @@ class SectorFlowRealtimeService:
             "data": {
                 "source_time": self._last_source_time,
                 "received_at": received_at,
-                "complete": len(valid_flows) == len(self._selection),
-                "flows": broadcast_flows,
+                "complete": len(valid_flows) == len(universe),
+                "selection": self.selection_data(30),
+                "radar": self._radar,
+                "flows": [flow for flow in broadcast_flows if flow["sector_code"] in selected_codes],
+                "status": self.status_data(),
             },
         })
         return True
@@ -799,10 +948,15 @@ class SectorFlowRealtimeService:
         while True:
             now = datetime.now(CST)
             session_status = market_status_at(now)
-            if now.weekday() < 5 and self._selection_date != now.date():
-                await self._ensure_selection(now.date())
-            self._schedule_minute_backfill(now, loop.time())
-            await self._refresh_daily_cache_after_close(now, loop.time())
+            if now.weekday() < 5 and (
+                self._selection_date != now.date()
+                or (session_status != "closed" and not self._universe)
+            ):
+                await self._ensure_selection(
+                    now.date(), allow_fetch=session_status != "closed"
+                )
+            if session_status == "open":
+                self._schedule_minute_backfill(now, loop.time())
 
             if session_status == "open":
                 try:
@@ -843,6 +997,8 @@ class SectorFlowRealtimeService:
             "last_source_time": self._last_source_time,
             "last_received_at": self._last_received_at,
             "selected_count": len(self._selection),
+            "universe_count": len(self._universe),
+            "universe_warning": None if self._universe else "全行业列表暂不可用，当前显示历史板块名单，动态排名暂停",
             "last_error": self._last_error,
             "poll_seconds": self.poll_seconds,
             "backfill_status": self._backfill_status,
@@ -867,6 +1023,7 @@ class SectorFlowRealtimeService:
             "type": "snapshot",
             "data": {
                 "selection": self.selection_data(30),
+                "radar": self._radar,
                 "flows": [
                     self._latest[code]
                     for code in ordered_codes

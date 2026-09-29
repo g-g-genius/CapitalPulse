@@ -128,6 +128,7 @@ class SectorFlowDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.service = SectorFlowRealtimeService()
         self.service.db_path = Path(self.temp_dir.name) / "sector-flow.sqlite3"
         self.service._open_database()
+        self.service._universe_retry_at = float("inf")
 
     def tearDown(self):
         if self.service.ready:
@@ -135,7 +136,7 @@ class SectorFlowDatabaseTests(unittest.IsolatedAsyncioTestCase):
             self.service._connection = None
         self.temp_dir.cleanup()
 
-    async def test_daily_selection_is_reused_without_refetching(self):
+    async def test_daily_selection_is_reused_when_universe_refresh_fails(self):
         trade_date = date(2026, 7, 27)
         self.service._save_selection(trade_date, make_sectors())
 
@@ -151,7 +152,22 @@ class SectorFlowDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result)
         self.assertEqual(len(self.service._selection), 30)
         self.assertEqual(self.service._selection[0]["rank"], 1)
+        get_sectors.assert_awaited_once()
+
+    async def test_after_close_loads_stored_selection_without_upstream_retry(self):
+        trade_date = date(2026, 7, 27)
+        self.service._save_selection(trade_date, make_sectors())
+        with (
+            patch(
+                "services.sector_flow_realtime.fetch_all_industry_sectors",
+                new=AsyncMock(),
+            ) as get_sectors,
+            patch.object(self.service, "broadcast", new=AsyncMock()),
+        ):
+            self.assertTrue(await self.service._ensure_selection(trade_date, allow_fetch=False))
+            self.assertTrue(await self.service._ensure_selection(trade_date, allow_fetch=False))
         get_sectors.assert_not_awaited()
+        self.assertEqual(len(self.service._selection), 30)
 
     def test_upsert_revision_history_order_and_top_cropping(self):
         trade_date = date(2026, 7, 27)
@@ -684,6 +700,54 @@ class SectorFlowDatabaseTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
 
+    async def test_full_universe_reorders_current_inflow_and_outflow_top_15(self):
+        current = datetime(2026, 7, 27, 10, 0, tzinfo=CST)
+        sectors = make_sectors(40)
+        self.service._universe = sectors
+        self.service._selection_date = current.date()
+        self.service._selection = []
+
+        def batch(stamp: int, reverse: bool = False):
+            flows = []
+            for index, sector in enumerate(sectors, start=1):
+                value = index * 1e8 if index <= 20 else -(index - 20) * 1e8
+                if reverse and index == 1:
+                    value = 30e8
+                if reverse and index == 21:
+                    value = -30e8
+                flows.append(make_flow(sector["code"], stamp, value))
+            return flows
+
+        with (
+            patch.object(self.service, "_fetch_snapshot", new=AsyncMock(side_effect=[
+                batch(int(current.timestamp())),
+                batch(int((current + timedelta(seconds=3)).timestamp()), True),
+            ])),
+            patch.object(self.service, "broadcast", new=AsyncMock()) as broadcast,
+        ):
+            self.assertTrue(await self.service.collect_once(current))
+            self.assertEqual(len(self.service._selection), 30)
+            self.assertNotIn("BK0001", [sector["code"] for sector in self.service._selection])
+            self.assertTrue(await self.service.collect_once(current + timedelta(seconds=3)))
+
+        codes = [sector["code"] for sector in self.service._selection]
+        self.assertEqual(codes[0], "BK0001")
+        self.assertEqual(codes[15], "BK0021")
+        self.assertEqual(len(self.service._load_selection(current.date())), 30)
+        self.assertEqual(broadcast.await_args.args[0]["data"]["selection"][0]["sector_code"], "BK0001")
+        series = self.service.history_data(current.date(), 30)["series"]
+        self.assertEqual(len(next(item for item in series if item["sector_code"] == "BK0001")["points"]), 2)
+
+    def test_radar_marks_recent_negative_to_positive_turn(self):
+        stamp = int(datetime(2026, 7, 27, 10, 0, tzinfo=CST).timestamp())
+        self.service._update_radar([make_flow("BK0001", stamp, -1e8)], stamp)
+        self.service._update_radar([make_flow("BK0001", stamp + 15, 2e8)], stamp + 15)
+        signal = self.service._radar["sectors"][0]
+        self.assertTrue(signal["turned_positive"])
+        self.assertEqual(signal["change_15s"], 3e8)
+        self.service._update_radar([make_flow("BK0001", stamp + 21, 1e8)], stamp + 21)
+        self.assertTrue(self.service._radar["sectors"][0]["turned_positive"])
+
     async def test_stale_snapshot_is_not_persisted(self):
         current = datetime(2026, 7, 27, 10, 0, tzinfo=CST)
         stale_time = int(datetime(2026, 7, 26, 10, 0, tzinfo=CST).timestamp())
@@ -711,6 +775,41 @@ class SectorFlowDatabaseTests(unittest.IsolatedAsyncioTestCase):
             0,
         )
 
+    async def test_brief_snapshot_failure_keeps_recent_chart_available(self):
+        current = datetime(2026, 7, 27, 10, 0, tzinfo=CST)
+        self.service._selection = [
+            {**sector, "rank": rank}
+            for rank, sector in enumerate(make_sectors(), start=1)
+        ]
+        self.service._selection_date = current.date()
+        flow = make_flow("BK0001", int(current.timestamp()))
+        with (
+            patch.object(self.service, "_fetch_snapshot", new=AsyncMock(side_effect=[[flow], None, None])),
+            patch.object(self.service, "broadcast", new=AsyncMock()),
+        ):
+            self.assertTrue(await self.service.collect_once(current))
+            self.assertFalse(await self.service.collect_once(current + timedelta(seconds=6)))
+            self.assertEqual(self.service.status_data()["market_status"], "open")
+            self.assertFalse(await self.service.collect_once(current + timedelta(seconds=15)))
+        self.assertEqual(self.service.status_data()["market_status"], "stale")
+        self.assertIsNone(self.service.status_data()["last_error"])
+
+    async def test_sustained_snapshot_failure_reports_error(self):
+        current = datetime(2026, 7, 27, 10, 0, tzinfo=CST)
+        self.service._selection = [
+            {**sector, "rank": rank}
+            for rank, sector in enumerate(make_sectors(), start=1)
+        ]
+        self.service._selection_date = current.date()
+        self.service._last_source_time = int(current.timestamp()) - 31
+        with (
+            patch.object(self.service, "_fetch_snapshot", new=AsyncMock(return_value=None)),
+            patch.object(self.service, "broadcast", new=AsyncMock()),
+        ):
+            self.assertFalse(await self.service.collect_once(current))
+        self.assertEqual(self.service.status_data()["market_status"], "error")
+        self.assertEqual(self.service.status_data()["last_error"], "板块资金快照请求失败")
+
     async def test_primary_failure_uses_delay_endpoint(self):
         self.service._selection = [
             {**sector, "rank": rank}
@@ -736,6 +835,7 @@ class SectorFlowDatabaseTests(unittest.IsolatedAsyncioTestCase):
             result = await self.service._fetch_snapshot()
 
         self.assertEqual(fetch.await_count, 2)
+        self.assertNotIn("ut", fetch.await_args.kwargs["params"])
         self.assertEqual(result[0]["sector_code"], "BK0001")
 
     async def test_failed_websocket_is_isolated(self):

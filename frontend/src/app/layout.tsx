@@ -16,7 +16,7 @@ const themeInitScript = `(function(){try{var d=document.documentElement;var dark
 
 export const metadata: Metadata = {
   title: "行业板块资金流向",
-  description: "A 股申万二级行业 Top 30 实时资金流看板",
+  description: "A 股申万二级行业动态资金流榜单与短线异动雷达",
   icons: { icon: "/logo.svg" },
 };
 

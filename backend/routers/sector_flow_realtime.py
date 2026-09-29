@@ -29,7 +29,7 @@ async def get_sector_stock_candidates(
 @router.get("/sector-flow/history")
 async def get_sector_flow_history(
     trade_date: date | None = Query(None, description="CST trade date"),
-    top: int = Query(10, description="Fixed market-cap ranks to return"),
+    top: int = Query(10, description="Current intraday net-inflow and net-outflow ranks to return"),
 ):
     if top not in (10, 30):
         return {"code": 400, "msg": "top must be 10 or 30", "data": None}
@@ -65,7 +65,7 @@ async def get_sector_flow_detail_history(
 @router.get("/sector-flow/daily-history")
 async def get_sector_flow_daily_history(
     trade_date: date | None = Query(None, description="CST trade date"),
-    top: int = Query(30, description="Fixed market-cap ranks to return"),
+    top: int = Query(30, description="Current intraday net-flow ranks to return"),
     days: int = Query(30, description="Daily trading records to return"),
     page: int = Query(1, ge=1, description="Six-sector daily history page"),
 ):

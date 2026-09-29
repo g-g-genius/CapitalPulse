@@ -199,13 +199,34 @@ function mergeDailyHistory(
   }
 }
 
-type ChartMode = 'main' | 'detail' | 'daily' | 'stock'
+type ChartMode = 'main' | 'radar' | 'detail' | 'daily' | 'stock'
+
+type RadarSector = {
+  sector_code: string
+  sector_name: string
+  main_net: number
+  change_15s: number | null
+  change_1m: number | null
+  change_3m: number | null
+  turned_positive: boolean
+  turn_time: number | null
+  source_time: number
+  points: [number, number][]
+}
+
+type RadarData = {
+  source_time: number | null
+  scanned_count: number
+  sectors: RadarSector[]
+}
 
 type ServiceStatus = {
   market_status: 'preopen' | 'open' | 'lunch' | 'closed' | 'stale' | 'error'
   last_source_time: number | null
   last_received_at: string | null
   selected_count: number
+  universe_count?: number
+  universe_warning?: string | null
   last_error: string | null
   poll_seconds: number
   backfill_status?: 'idle' | 'running' | 'complete' | 'error'
@@ -222,8 +243,8 @@ type HistoryData = {
 }
 
 type SocketMessage =
-  | { type: 'snapshot'; data: { selection: Selection[]; flows: Flow[]; status: ServiceStatus } }
-  | { type: 'update'; data: { source_time: number; received_at: string; complete: boolean; flows: Flow[] } }
+  | { type: 'snapshot'; data: { selection: Selection[]; flows: Flow[]; radar: RadarData; status: ServiceStatus } }
+  | { type: 'update'; data: { source_time: number; received_at: string; complete: boolean; selection: Selection[]; radar: RadarData; flows: Flow[]; status: ServiceStatus } }
   | { type: 'status' | 'heartbeat'; data: ServiceStatus }
   | { type: 'history_backfill'; data: { trade_date: string; inserted_points: number } }
 
@@ -347,6 +368,24 @@ function formatYi(value: number, digits = 2): string {
   return `${value >= 0 ? '+' : ''}${(value / 1e8).toFixed(digits)}亿`
 }
 
+function RadarSparkline({ points }: { points: [number, number][] }) {
+  if (points.length < 2) return <div className="text-xs text-slate-400">正在积累分钟数据…</div>
+  const values = points.map((point) => point[1])
+  const min = Math.min(0, ...values)
+  const max = Math.max(0, ...values)
+  const span = Math.max(1, max - min)
+  const first = points[0][0]
+  const seconds = Math.max(1, points.at(-1)![0] - first)
+  const coordinate = (point: [number, number]) => `${((point[0] - first) / seconds) * 100},${80 - ((point[1] - min) / span) * 70}`
+  const zeroY = 80 - ((0 - min) / span) * 70
+  return (
+    <svg viewBox="0 0 100 90" preserveAspectRatio="none" className="h-32 w-full" role="img" aria-label="最近四分钟主力资金累计变化">
+      <line x1="0" x2="100" y1={zeroY} y2={zeroY} stroke="#cbd5e1" strokeDasharray="2 2" strokeWidth="0.4" />
+      <polyline fill="none" stroke={values.at(-1)! >= 0 ? '#dc2626' : '#059669'} strokeWidth="1.4" vectorEffect="non-scaling-stroke" points={points.map(coordinate).join(' ')} />
+    </svg>
+  )
+}
+
 function formatQuoteDateTime(timestamp: number | null): string {
   if (!timestamp) return '暂无时间'
   return new Intl.DateTimeFormat('zh-CN', {
@@ -417,6 +456,8 @@ function mergeHistory(
       sector_name: namesByCode.get(flow.sector_code) ?? flow.sector_name,
       points: [],
     }
+    series.rank = rank
+    series.sector_name = namesByCode.get(flow.sector_code) ?? flow.sector_name
     const lastPoint = series.points.at(-1)
     if (lastPoint?.[0] === flow.source_time) {
       lastPoint[1] = flow.main_net
@@ -1053,6 +1094,9 @@ export default function SectorFlowPage() {
   const [loadError, setLoadError] = useState<string | null>(null)
   const [flashingEndpoints, setFlashingEndpoints] = useState<Set<string>>(() => new Set())
   const [chartMode, setChartMode] = useState<ChartMode>('main')
+  const [radar, setRadar] = useState<RadarData>({ source_time: null, scanned_count: 0, sectors: [] })
+  const [radarFocusedCode, setRadarFocusedCode] = useState<string | null>(null)
+  const selectionCodesRef = useRef<string>('')
   const [hoveredCode, setHoveredCode] = useState<string | null>(null)
   const [pinnedCode, setPinnedCode] = useState<string | null>(null)
   const [candidateData, setCandidateData] = useState<SectorCandidateData | null>(null)
@@ -1210,6 +1254,7 @@ export default function SectorFlowPage() {
       try {
         const message = JSON.parse(event.data) as SocketMessage
         if (message.type === 'snapshot') {
+          if (message.data.radar) setRadar(message.data.radar)
           setDetailPages((pages) => Object.fromEntries(
             Object.entries(pages).map(([page, data]) => [page, mergeDetailHistoryPage(data, message.data.flows)]),
           ))
@@ -1218,19 +1263,14 @@ export default function SectorFlowPage() {
             status: message.data.status,
           }))
         } else if (message.type === 'update') {
+          if (message.data.radar) setRadar(message.data.radar)
           flashUpdatedEndpoints(message.data.flows)
           setDetailPages((pages) => Object.fromEntries(
             Object.entries(pages).map(([page, data]) => [page, mergeDetailHistoryPage(data, message.data.flows)]),
           ))
           setHistory((current) => ({
-            ...mergeHistory(current, message.data.flows),
-            status: {
-              ...current.status,
-              market_status: 'open',
-              last_source_time: message.data.source_time,
-              last_received_at: message.data.received_at,
-              last_error: null,
-            },
+            ...mergeHistory(current, message.data.flows, message.data.selection),
+            status: message.data.status,
           }))
         } else if (message.type === 'history_backfill') {
           void fetchHistory()
@@ -1268,6 +1308,14 @@ export default function SectorFlowPage() {
   useEffect(() => {
     latestFlowsRef.current = history.latest
   }, [history.latest])
+
+  useEffect(() => {
+    const codes = history.selection.map((sector) => sector.sector_code).sort().join(',')
+    if (codes && selectionCodesRef.current && codes !== selectionCodesRef.current) {
+      void fetchHistory()
+    }
+    selectionCodesRef.current = codes
+  }, [history.selection, fetchHistory])
 
   useEffect(() => {
     if (chartMode !== 'detail' || detailPages[detailPage]) return
@@ -1789,6 +1837,14 @@ export default function SectorFlowPage() {
   const inflowCount = visibleLatest.filter((flow) => flow.main_net > 0).length
   const outflowCount = visibleLatest.filter((flow) => flow.main_net < 0).length
   const leader = [...visibleLatest].sort((a, b) => b.main_net - a.main_net)[0]
+  const radarTurns = radar.sectors.filter((sector) => sector.turned_positive)
+    .sort((a, b) => (b.turn_time ?? 0) - (a.turn_time ?? 0)).slice(0, 8)
+  const radarRising = radar.sectors.filter((sector) => sector.change_15s !== null)
+    .sort((a, b) => (b.change_15s ?? 0) - (a.change_15s ?? 0)).slice(0, 10)
+  const radarFalling = radar.sectors.filter((sector) => sector.change_15s !== null)
+    .sort((a, b) => (a.change_15s ?? 0) - (b.change_15s ?? 0)).slice(0, 10)
+  const radarFocused = radar.sectors.find((sector) => sector.sector_code === radarFocusedCode)
+    ?? radarTurns[0] ?? radarRising[0] ?? null
   const activeDetailPage = detailPages[detailPage]
   const detailTotalPages = Math.max(
     1,
@@ -1844,10 +1900,10 @@ export default function SectorFlowPage() {
       : chartMode === 'stock'
         ? stockError
         : null
-  const isDelayed = history.status.market_status === 'stale'
-    || (history.status.market_status === 'open'
-      && !!history.status.last_source_time
-      && Date.now() / 1000 - history.status.last_source_time > 30)
+  const isDelayed = (history.status.market_status === 'stale'
+    || history.status.market_status === 'open')
+    && !!history.status.last_source_time
+    && Date.now() / 1000 - history.status.last_source_time > 30
 
   return (
     <main className="min-h-screen bg-slate-50 text-slate-950 dark:bg-slate-950 dark:text-slate-100">
@@ -1860,10 +1916,10 @@ export default function SectorFlowPage() {
       </header>
 
       <div className="mx-auto max-w-[1800px] space-y-3 px-3 py-3 sm:px-4">
-        {(loadError || activeViewError || isDelayed || history.status.last_error || history.status.backfill_error) && (
+        {(loadError || activeViewError || isDelayed || history.status.last_error || history.status.backfill_error || history.status.universe_warning) && (
           <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300">
             <CircleAlert className="mt-0.5 size-4 shrink-0" />
-            <span>{loadError || activeViewError || history.status.last_error || history.status.backfill_error || '数据源更新时间超过30秒，曲线可能暂时停滞。'}</span>
+            <span>{loadError || activeViewError || history.status.universe_warning || history.status.last_error || history.status.backfill_error || '数据源更新时间超过30秒，曲线可能暂时停滞。'}</span>
           </div>
         )}
 
@@ -1872,7 +1928,7 @@ export default function SectorFlowPage() {
             <MetricCard
               title="净流入 / 净流出"
               value={`${inflowCount} / ${outflowCount}`}
-              detail="申万二级行业 Top 30"
+              detail={history.status.universe_count ? '实时流入前15 / 流出前15' : '等待全行业名单，暂显示历史板块'}
             />
             <MetricCard
               title="当前最强行业"
@@ -1918,6 +1974,18 @@ export default function SectorFlowPage() {
                 </button>
                 <button
                   type="button"
+                  onClick={() => setChartMode('radar')}
+                  aria-pressed={chartMode === 'radar'}
+                  className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
+                    chartMode === 'radar'
+                      ? 'bg-white text-slate-900 shadow-sm dark:bg-slate-700 dark:text-white'
+                      : 'text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white'
+                  }`}
+                >
+                  异动雷达
+                </button>
+                <button
+                  type="button"
                   onClick={() => setChartMode('detail')}
                   aria-pressed={chartMode === 'detail'}
                   className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
@@ -1957,19 +2025,21 @@ export default function SectorFlowPage() {
                 <h2 className="font-medium">
                   {chartMode === 'main'
                     ? '主力资金累计曲线'
+                    : chartMode === 'radar'
+                      ? '全行业短线异动雷达'
                     : chartMode === 'detail'
                       ? '行业细分资金流向'
                       : chartMode === 'daily'
                         ? '30日主力资金流向曲线'
                         : '个股实时资金流向'}
                 </h2>
-                {chartMode === 'main' || chartMode === 'daily' ? (
+                {chartMode === 'main' || chartMode === 'daily' || chartMode === 'radar' ? (
                   <div className="mt-1 flex flex-wrap items-center justify-end gap-3 text-xs text-slate-500">
                     <span className="flex items-center gap-1"><span className="size-2 rounded-full bg-red-600" />净流入</span>
                     <span className="flex items-center gap-1"><span className="size-2 rounded-full bg-emerald-600" />净流出</span>
                     <span className="flex items-center gap-1">
                       <Clock3 className="size-3" />
-                      {chartMode === 'main'
+                      {chartMode === 'main' || chartMode === 'radar'
                         ? formatTime(history.status.last_source_time)
                         : `日频 · 截至 ${dailyLastDate ?? '--'}`}
                     </span>
@@ -1992,6 +2062,87 @@ export default function SectorFlowPage() {
                 )}
               </div>
             </div>
+
+            {chartMode === 'radar' && (
+              <div className="min-h-[560px] bg-slate-50/70 p-4 dark:bg-slate-950/40">
+                <div className="mb-4 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
+                  <span>扫描 {radar.scanned_count} / {history.status.universe_count ?? 0} 个二级行业 · 15 秒资金变化排序 · 由负转正信号保留 5 分钟</span>
+                  <span>源时间 {formatTime(radar.source_time)}</span>
+                </div>
+                {radar.sectors.length === 0 ? (
+                  <div className="flex h-64 items-center justify-center text-sm text-slate-500">{history.status.universe_warning || '等待全行业实时快照…'}</div>
+                ) : (
+                  <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
+                    <div className="grid gap-4 lg:grid-cols-3">
+                      {[
+                        { title: '由负转正', description: '最近 5 分钟内跨过零轴', sectors: radarTurns, empty: '暂无新信号' },
+                        { title: '短时流入加速', description: '15 秒主力净流入增量', sectors: radarRising, empty: '正在积累 15 秒数据' },
+                        { title: '短时流出加速', description: '15 秒主力净流出增量', sectors: radarFalling, empty: '正在积累 15 秒数据' },
+                      ].map((group) => (
+                        <section key={group.title} className="min-w-0 rounded-xl border border-slate-200 bg-white dark:border-slate-800 dark:bg-slate-900">
+                          <div className="border-b border-slate-100 px-3 py-3 dark:border-slate-800">
+                            <h3 className="text-sm font-semibold">{group.title}</h3>
+                            <p className="mt-0.5 text-xs text-slate-500">{group.description}</p>
+                          </div>
+                          <div className="max-h-[550px] overflow-y-auto p-2">
+                            {group.sectors.length === 0 && <p className="p-3 text-xs text-slate-500">{group.empty}</p>}
+                            {group.sectors.map((sector) => (
+                              <button
+                                key={sector.sector_code}
+                                type="button"
+                                onClick={() => setRadarFocusedCode(sector.sector_code)}
+                                className={`mb-1 w-full rounded-lg border px-3 py-2 text-left transition-colors hover:bg-slate-50 dark:hover:bg-slate-800 ${radarFocused?.sector_code === sector.sector_code ? 'border-slate-400 bg-slate-50 dark:border-slate-500 dark:bg-slate-800' : 'border-transparent'}`}
+                              >
+                                <div className="flex items-center justify-between gap-2 text-sm">
+                                  <span className="truncate font-medium">{displayName(sector.sector_name)}</span>
+                                  <span className={`shrink-0 font-mono ${sector.main_net >= 0 ? 'text-red-600' : 'text-emerald-600'}`}>{formatYi(sector.main_net)}</span>
+                                </div>
+                                <div className="mt-1 flex items-center justify-between text-xs text-slate-500">
+                                  <span>15秒 {sector.change_15s === null ? '--' : formatYi(sector.change_15s)}</span>
+                                  <span>1分 {sector.change_1m === null ? '--' : formatYi(sector.change_1m)}</span>
+                                </div>
+                              </button>
+                            ))}
+                          </div>
+                        </section>
+                      ))}
+                    </div>
+                    <aside className="self-start rounded-xl border border-slate-200 bg-white p-4 dark:border-slate-800 dark:bg-slate-900">
+                      {radarFocused ? (
+                        <>
+                          <div className="flex items-start justify-between gap-3">
+                            <div>
+                              <div className="text-xs text-slate-500">当前观察板块</div>
+                              <h3 className="mt-1 text-lg font-semibold">{displayName(radarFocused.sector_name)}</h3>
+                            </div>
+                            {radarFocused.turned_positive && <span className="rounded bg-red-50 px-2 py-1 text-xs font-medium text-red-600 dark:bg-red-950/50">由负转正</span>}
+                          </div>
+                          <div className={`mt-3 font-mono text-2xl font-semibold ${radarFocused.main_net >= 0 ? 'text-red-600' : 'text-emerald-600'}`}>{formatYi(radarFocused.main_net)}</div>
+                          <p className="mt-1 text-xs text-slate-500">当日主力资金累计净流入</p>
+                          <div className="mt-5 grid grid-cols-3 gap-2 text-xs">
+                            {([['15秒', radarFocused.change_15s], ['1分钟', radarFocused.change_1m], ['3分钟', radarFocused.change_3m]] as const).map(([label, value]) => (
+                              <div key={label} className="rounded-lg bg-slate-50 p-2 dark:bg-slate-800">
+                                <div className="text-slate-500">{label}变化</div>
+                                <div className={`mt-1 font-mono font-semibold ${value === null ? 'text-slate-400' : value >= 0 ? 'text-red-600' : 'text-emerald-600'}`}>{value === null ? '--' : formatYi(value)}</div>
+                              </div>
+                            ))}
+                          </div>
+                          <div className="mt-5 border-t border-slate-100 pt-3 dark:border-slate-800">
+                            <p className="mb-2 text-xs text-slate-500">最近 4 分钟累计资金轨迹</p>
+                            <RadarSparkline points={radarFocused.points} />
+                            <div className="mt-2 flex justify-between text-[11px] text-slate-500">
+                              <span>{formatTime(radarFocused.points[0]?.[0])}</span>
+                              <span>{formatTime(radarFocused.source_time)}</span>
+                            </div>
+                          </div>
+                          <p className="mt-4 text-[11px] leading-4 text-slate-500">排名依据为资金增量，需结合价格、成交量确认；信号仅供观察。</p>
+                        </>
+                      ) : <p className="text-sm text-slate-500">选择左侧板块查看资金变化。</p>}
+                    </aside>
+                  </div>
+                )}
+              </div>
+            )}
 
             <div className={chartMode === 'main' ? 'flex min-h-[480px] flex-col xl:flex-row' : 'hidden'}>
               <div className="relative h-[480px] min-h-[420px] min-w-0 flex-1 sm:h-[560px] lg:h-[640px]">
