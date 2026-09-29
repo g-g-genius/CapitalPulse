@@ -105,6 +105,36 @@ const DEFAULT_STOCK: StockSearchResult = {
   pinyin: 'PAYH',
 }
 const STOCK_SELECTION_STORAGE_KEY = 'capitalpulse.stock-flow.selection'
+const STOCK_RECENTS_STORAGE_KEY = 'capitalpulse.stock-flow.recents'
+const MAX_RECENT_STOCKS = 20
+
+function rememberStock(recent: StockSearchResult[], stock: StockSearchResult): StockSearchResult[] {
+  return [stock, ...recent.filter((item) => item.quote_id !== stock.quote_id)]
+    .slice(0, MAX_RECENT_STOCKS)
+}
+
+function parseRecentStocks(value: unknown): StockSearchResult[] {
+  if (!Array.isArray(value)) return []
+  const seen = new Set<string>()
+  return value.flatMap((item): StockSearchResult[] => {
+    if (
+      !item || typeof item !== 'object'
+      || typeof item.quote_id !== 'string'
+      || typeof item.code !== 'string'
+      || typeof item.name !== 'string'
+      || !item.quote_id || !item.code || !item.name
+      || seen.has(item.quote_id)
+    ) return []
+    seen.add(item.quote_id)
+    return [{
+      quote_id: item.quote_id,
+      code: item.code,
+      name: item.name,
+      market_name: typeof item.market_name === 'string' ? item.market_name : '',
+      pinyin: typeof item.pinyin === 'string' ? item.pinyin : '',
+    }]
+  }).slice(0, MAX_RECENT_STOCKS)
+}
 
 type StockFlowSession = {
   runtime_id: string
@@ -1011,12 +1041,38 @@ export default function SectorFlowPage() {
   const [stockSearching, setStockSearching] = useState(false)
   const [stockSearchError, setStockSearchError] = useState<string | null>(null)
   const [selectedStock, setSelectedStock] = useState<StockSearchResult | null>(null)
+  const [recentStocks, setRecentStocks] = useState<StockSearchResult[]>([])
+  const [recentStocksReady, setRecentStocksReady] = useState(false)
   const [stockRuntimeId, setStockRuntimeId] = useState<string | null>(null)
   const [stockSelectionReady, setStockSelectionReady] = useState(false)
   const [stockHistory, setStockHistory] = useState<StockFlowHistory | null>(null)
   const [stockMarketStatus, setStockMarketStatus] = useState<ServiceStatus['market_status']>('closed')
   const [stockError, setStockError] = useState<string | null>(null)
   const [stockFlashing, setStockFlashing] = useState(false)
+
+  useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem(STOCK_RECENTS_STORAGE_KEY)
+      if (saved) setRecentStocks(parseRecentStocks(JSON.parse(saved)))
+    } catch {
+      // Browsers with unavailable storage still keep recent stocks for this visit.
+    }
+    setRecentStocksReady(true)
+  }, [])
+
+  useEffect(() => {
+    if (!recentStocksReady || !stockSelectionReady || !selectedStock) return
+    setRecentStocks((recent) => rememberStock(recent, selectedStock))
+  }, [recentStocksReady, selectedStock, stockSelectionReady])
+
+  useEffect(() => {
+    if (!recentStocksReady) return
+    try {
+      window.localStorage.setItem(STOCK_RECENTS_STORAGE_KEY, JSON.stringify(recentStocks))
+    } catch {
+      // Recent stocks remain available in memory when browser storage is disabled.
+    }
+  }, [recentStocks, recentStocksReady])
 
   useEffect(() => {
     const controller = new AbortController()
@@ -1696,6 +1752,22 @@ export default function SectorFlowPage() {
     .sort()
     .at(-1)
   const stockLastTime = stockHistory?.points.at(-1)?.[0] ?? null
+  const chooseStock = (stock: StockSearchResult) => {
+    const nextRecent = rememberStock(recentStocks, stock)
+    setRecentStocks(nextRecent)
+    try {
+      window.localStorage.setItem(STOCK_RECENTS_STORAGE_KEY, JSON.stringify(nextRecent))
+    } catch {
+      // The visible list still works when browser storage is disabled.
+    }
+    if (selectedStock?.quote_id !== stock.quote_id) {
+      setSelectedStock(stock)
+      setStockHistory(null)
+      setStockError(null)
+    }
+    setStockQuery('')
+    setStockSearchResults([])
+  }
   const reloadDailyPage = () => {
     setDailyError(null)
     setDailyPages((pages) => {
@@ -2080,13 +2152,7 @@ export default function SectorFlowPage() {
                           <button
                             key={stock.quote_id}
                             type="button"
-                            onClick={() => {
-                              setSelectedStock(stock)
-                              setStockHistory(null)
-                              setStockQuery('')
-                              setStockSearchResults([])
-                              setStockError(null)
-                            }}
+                            onClick={() => chooseStock(stock)}
                             className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-left text-sm transition-colors hover:bg-slate-100 dark:hover:bg-slate-800"
                           >
                             <span className="font-medium">{stock.name}</span>
@@ -2096,14 +2162,36 @@ export default function SectorFlowPage() {
                       </div>
                     )}
                   </div>
-                  {selectedStock ? (
-                    <div className="flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm dark:border-slate-700 dark:bg-slate-900">
-                      <span className="font-medium">{selectedStock.name}</span>
-                      <span className="font-mono text-xs text-slate-500">{selectedStock.code}</span>
-                    </div>
-                  ) : (
-                    <span className="text-xs text-slate-500">选择股票后开始秒级采集</span>
-                  )}
+                  <div
+                    className="flex min-w-0 flex-1 basis-full items-center gap-2 overflow-x-auto pb-1 sm:basis-0"
+                    role="group"
+                    aria-label="最近查看的股票"
+                  >
+                    <span className="shrink-0 text-xs text-slate-500">最近查看</span>
+                    {recentStocks.length === 0 && (
+                      <span className="shrink-0 text-xs text-slate-400">搜索并选择股票后会显示在这里</span>
+                    )}
+                    {recentStocks.map((stock) => {
+                      const active = selectedStock?.quote_id === stock.quote_id
+                      return (
+                        <button
+                          key={stock.quote_id}
+                          type="button"
+                          onClick={() => chooseStock(stock)}
+                          aria-pressed={active}
+                          title={`${stock.name} ${stock.code}`}
+                          className={`flex h-9 shrink-0 items-center gap-2 rounded-lg border px-3 text-sm transition-colors ${
+                            active
+                              ? 'border-slate-400 bg-slate-100 text-slate-950 dark:border-slate-500 dark:bg-slate-800 dark:text-white'
+                              : 'border-slate-200 bg-white text-slate-600 hover:border-slate-400 hover:text-slate-950 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-300 dark:hover:border-slate-500 dark:hover:text-white'
+                          }`}
+                        >
+                          <span className="font-medium">{stock.name}</span>
+                          <span className="font-mono text-xs text-slate-500">{stock.code}</span>
+                        </button>
+                      )
+                    })}
+                  </div>
                 </div>
 
                 <div className="relative min-h-0 flex-1">
