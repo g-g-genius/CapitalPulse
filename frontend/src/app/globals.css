@@ -5,6 +5,8 @@
 @theme inline {
   --font-sans: var(--font-geist-sans);
   --font-mono: var(--font-geist-mono);
+  --color-red-600: var(--flow-positive);
+  --color-emerald-600: var(--flow-negative);
 }
 
 @layer base {

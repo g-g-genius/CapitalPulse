@@ -1,8 +1,8 @@
 'use client'
 
-// Single-page real-time sector capital-flow dashboard.
+// CapitalPulse market research workspace.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import type {
   BarSeriesOption,
   ECharts,
@@ -12,13 +12,22 @@ import type {
   ScatterSeriesOption,
 } from 'echarts'
 import {
+  Activity,
+  ArrowDownLeft,
+  ArrowUpRight,
+  BarChart3,
+  Bookmark,
   ChevronLeft,
   ChevronRight,
   CircleAlert,
   Clock3,
+  Layers3,
+  LayoutDashboard,
+  Moon,
   Radio,
-  TrendingDown,
-  TrendingUp,
+  Radar,
+  Search,
+  Sun,
 } from 'lucide-react'
 
 type Flow = {
@@ -200,6 +209,20 @@ function mergeDailyHistory(
 }
 
 type ChartMode = 'main' | 'radar' | 'detail' | 'daily' | 'stock'
+type Theme = 'light' | 'dark'
+const ThemeContext = createContext<Theme>('dark')
+const CHART_THEMES = {
+  dark: { muted: '#7e8ba0', axis: '#344052', grid: '#2b3544', surface: '#171e29', text: '#e5eaf3', positive: '#f07988', negative: '#50c8a3' },
+  light: { muted: '#7a879b', axis: '#d7dfe9', grid: '#e1e7ef', surface: '#ffffff', text: '#273246', positive: '#da4a60', negative: '#168865' },
+}
+
+const WORKSPACE_VIEWS = [
+  { id: 'main', label: '资金总览', description: '观察资金方向，跟踪板块轮动。', icon: LayoutDashboard, english: 'MARKET OVERVIEW' },
+  { id: 'radar', label: '异动雷达', description: '从短时资金变化中，发现正在启动的板块。', icon: Radar, english: 'MOMENTUM RADAR' },
+  { id: 'detail', label: '行业细分', description: '拆解不同订单规模的资金流向。', icon: Layers3, english: 'SECTOR ANALYSIS' },
+  { id: 'daily', label: '30日资金', description: '拉长时间，看清板块资金的持续性。', icon: BarChart3, english: 'CAPITAL TRENDS' },
+  { id: 'stock', label: '个股研究', description: '搜索股票，追踪日内资金与历史观察记录。', icon: Search, english: 'STOCK RESEARCH' },
+] as const
 
 type RadarSector = {
   sector_code: string
@@ -275,9 +298,6 @@ const DETAIL_METRICS = [
 
 const DETAIL_PAGE_SIZE = 6
 
-const POSITIVE = '#c9363e'
-const NEGATIVE = '#16865b'
-const NEUTRAL = '#64748b'
 const MORNING_START_SECONDS = 9 * 3600 + 30 * 60
 const MORNING_END_SECONDS = 11 * 3600 + 30 * 60
 const AFTERNOON_START_SECONDS = 13 * 3600
@@ -380,8 +400,8 @@ function RadarSparkline({ points }: { points: [number, number][] }) {
   const zeroY = 80 - ((0 - min) / span) * 70
   return (
     <svg viewBox="0 0 100 90" preserveAspectRatio="none" className="h-32 w-full" role="img" aria-label="最近四分钟主力资金累计变化">
-      <line x1="0" x2="100" y1={zeroY} y2={zeroY} stroke="#cbd5e1" strokeDasharray="2 2" strokeWidth="0.4" />
-      <polyline fill="none" stroke={values.at(-1)! >= 0 ? '#dc2626' : '#059669'} strokeWidth="1.4" vectorEffect="non-scaling-stroke" points={points.map(coordinate).join(' ')} />
+      <line x1="0" x2="100" y1={zeroY} y2={zeroY} stroke="var(--app-border)" strokeDasharray="2 2" strokeWidth="0.4" />
+      <polyline fill="none" stroke={values.at(-1)! >= 0 ? 'var(--flow-positive)' : 'var(--flow-negative)'} strokeWidth="1.4" vectorEffect="non-scaling-stroke" points={points.map(coordinate).join(' ')} />
     </svg>
   )
 }
@@ -509,28 +529,13 @@ function mergeDetailHistoryPage(page: DetailHistoryPage, flows: Flow[]): DetailH
   }
 }
 
-function MetricCard({
-  title,
-  value,
-  detail,
-  positive,
-}: {
-  title: string
-  value: string
-  detail: string
-  positive?: boolean
-}) {
-  return (
-    <div className="rounded-xl border border-slate-200 bg-white px-4 py-3 shadow-sm dark:border-slate-800 dark:bg-slate-900">
-      <p className="text-xs text-slate-500 dark:text-slate-400">{title}</p>
-      <p className={`mt-1 font-mono text-xl font-semibold tabular-nums ${
-        positive === undefined ? 'text-slate-900 dark:text-white' : positive ? 'text-red-600' : 'text-emerald-600'
-      }`}>
-        {value}
-      </p>
-      <p className="mt-0.5 truncate text-xs text-slate-400">{detail}</p>
-    </div>
-  )
+function MiniSparkline({ points, positive }: { points: [number, number][]; positive: boolean }) {
+  if (points.length < 2) return <span className="text-xs text-slate-500">等待数据</span>
+  const values = points.map((point) => point[1])
+  const low = Math.min(...values)
+  const range = Math.max(1, Math.max(...values) - low)
+  const path = values.map((value, index) => `${index / (values.length - 1) * 180},${44 - (value - low) / range * 38}`).join(' ')
+  return <svg className="mini-sparkline" viewBox="0 0 180 50" role="img" aria-label="当日资金走势"><polyline points={path} fill="none" stroke={positive ? 'var(--flow-positive)' : 'var(--flow-negative)'} strokeWidth="1.8" strokeLinejoin="round" /></svg>
 }
 
 function DetailSectorChart({
@@ -543,6 +548,8 @@ function DetailSectorChart({
   const containerRef = useRef<HTMLDivElement | null>(null)
   const chartRef = useRef<ECharts | null>(null)
 
+  const theme = useContext(ThemeContext)
+  const palette = CHART_THEMES[theme]
   const option = useMemo<EChartsOption>(() => {
     const chartSeries: Array<LineSeriesOption | ScatterSeriesOption | EffectScatterSeriesOption> = []
     const preparedMetrics = DETAIL_METRICS.map((metric) => {
@@ -586,7 +593,7 @@ function DetailSectorChart({
         markLine: metricIndex === 0 ? {
           symbol: 'none',
           silent: true,
-          lineStyle: { color: '#94a3b8', width: 1, opacity: 0.65 },
+          lineStyle: { color: palette.muted, width: 1, opacity: 0.65 },
           label: { show: false },
           data: [{ yAxis: 0 }],
         } : undefined,
@@ -661,6 +668,9 @@ function DetailSectorChart({
         trigger: 'axis',
         confine: true,
         renderMode: 'richText',
+        backgroundColor: palette.surface,
+        borderColor: palette.axis,
+        textStyle: { color: palette.text, fontSize: 12 },
         formatter: (params: unknown) => {
           const items = (Array.isArray(params) ? params : [params]) as Array<{
             seriesName?: string
@@ -683,12 +693,12 @@ function DetailSectorChart({
         max: FULL_SESSION_SECONDS,
         interval: 2 * 3600,
         axisLabel: {
-          color: '#94a3b8',
+          color: palette.muted,
           fontSize: 10,
           hideOverlap: true,
           formatter: (value: number) => tradingAxisLabel(value),
         },
-        axisLine: { lineStyle: { color: '#cbd5e1' } },
+        axisLine: { lineStyle: { color: palette.axis } },
         splitLine: { show: false },
       },
       yAxis: {
@@ -699,13 +709,13 @@ function DetailSectorChart({
         nameLocation: 'middle',
         nameRotate: 90,
         nameGap: 38,
-        nameTextStyle: { color: '#94a3b8', fontSize: 10 },
-        axisLabel: { color: '#94a3b8', fontSize: 10 },
-        splitLine: { lineStyle: { color: '#e2e8f0', opacity: 0.45 } },
+        nameTextStyle: { color: palette.muted, fontSize: 10 },
+        axisLabel: { color: palette.muted, fontSize: 10 },
+        splitLine: { lineStyle: { color: palette.grid, opacity: 0.45 } },
       },
       series: chartSeries,
     }
-  }, [flashing, sector])
+  }, [flashing, sector, palette])
 
   useEffect(() => {
     let disposed = false
@@ -750,6 +760,8 @@ function StockFlowChart({
   const containerRef = useRef<HTMLDivElement | null>(null)
   const chartRef = useRef<ECharts | null>(null)
 
+  const theme = useContext(ThemeContext)
+  const palette = CHART_THEMES[theme]
   const option = useMemo<EChartsOption>(() => {
     const chartSeries: Array<LineSeriesOption | ScatterSeriesOption | EffectScatterSeriesOption> = []
     const preparedMetrics = DETAIL_METRICS.map((metric) => {
@@ -797,7 +809,7 @@ function StockFlowChart({
         markLine: metricIndex === 0 ? {
           symbol: 'none',
           silent: true,
-          lineStyle: { color: '#94a3b8', width: 1, opacity: 0.65 },
+          lineStyle: { color: palette.muted, width: 1, opacity: 0.65 },
           label: { show: false },
           data: [{ yAxis: 0 }],
         } : undefined,
@@ -872,6 +884,9 @@ function StockFlowChart({
         trigger: 'axis',
         confine: true,
         renderMode: 'richText',
+        backgroundColor: palette.surface,
+        borderColor: palette.axis,
+        textStyle: { color: palette.text, fontSize: 12 },
         formatter: (params: unknown) => {
           const items = (Array.isArray(params) ? params : [params]) as Array<{
             seriesName?: string
@@ -894,13 +909,13 @@ function StockFlowChart({
         max: FULL_SESSION_SECONDS,
         interval: 30 * 60,
         axisLabel: {
-          color: '#94a3b8',
+          color: palette.muted,
           hideOverlap: true,
           showMinLabel: true,
           showMaxLabel: true,
           formatter: (value: number) => tradingAxisLabel(value),
         },
-        axisLine: { lineStyle: { color: '#cbd5e1' } },
+        axisLine: { lineStyle: { color: palette.axis } },
         splitLine: { show: false },
       },
       yAxis: {
@@ -911,13 +926,13 @@ function StockFlowChart({
         nameLocation: 'middle',
         nameRotate: 90,
         nameGap: 48,
-        nameTextStyle: { color: '#94a3b8' },
-        axisLabel: { color: '#94a3b8', formatter: (value: number) => value.toFixed(1) },
-        splitLine: { lineStyle: { color: '#e2e8f0', opacity: 0.55 } },
+        nameTextStyle: { color: palette.muted },
+        axisLabel: { color: palette.muted, formatter: (value: number) => value.toFixed(1) },
+        splitLine: { lineStyle: { color: palette.grid, opacity: 0.55 } },
       },
       series: chartSeries,
     }
-  }, [data, flashing])
+  }, [data, flashing, palette])
 
   useEffect(() => {
     let disposed = false
@@ -948,6 +963,8 @@ function DailySectorChart({ sector }: { sector: DailySectorSeries }) {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const chartRef = useRef<ECharts | null>(null)
 
+  const theme = useContext(ThemeContext)
+  const palette = CHART_THEMES[theme]
   const option = useMemo<EChartsOption>(() => {
     const values = sector.points.map((point) => [point[0], point[1] / 1e8])
     const lastDateIndex = values.length - 1
@@ -964,14 +981,14 @@ function DailySectorChart({ sector }: { sector: DailySectorSeries }) {
       itemStyle: {
         color: (params) => {
           const amount = chartAmount(params.value)
-          return amount > 0 ? POSITIVE : amount < 0 ? NEGATIVE : NEUTRAL
+          return amount > 0 ? palette.positive : amount < 0 ? palette.negative : palette.muted
         },
       },
       emphasis: { focus: 'series' },
       markLine: {
         symbol: 'none',
         silent: true,
-        lineStyle: { color: '#94a3b8', width: 1, opacity: 0.75 },
+        lineStyle: { color: palette.muted, width: 1, opacity: 0.75 },
         label: { show: false },
         data: [{ yAxis: 0 }],
       },
@@ -986,6 +1003,9 @@ function DailySectorChart({ sector }: { sector: DailySectorSeries }) {
         trigger: 'axis',
         confine: true,
         renderMode: 'richText',
+        backgroundColor: palette.surface,
+        borderColor: palette.axis,
+        textStyle: { color: palette.text, fontSize: 12 },
         formatter: (params: unknown) => {
           const items = (Array.isArray(params) ? params : [params]) as Array<{
             seriesName?: string
@@ -1006,7 +1026,7 @@ function DailySectorChart({ sector }: { sector: DailySectorSeries }) {
         type: 'category',
         boundaryGap: true,
         axisLabel: {
-          color: '#94a3b8',
+          color: palette.muted,
           hideOverlap: false,
           showMinLabel: true,
           showMaxLabel: true,
@@ -1017,7 +1037,7 @@ function DailySectorChart({ sector }: { sector: DailySectorSeries }) {
           ),
           formatter: (value: string) => value.slice(5),
         },
-        axisLine: { lineStyle: { color: '#cbd5e1' } },
+        axisLine: { lineStyle: { color: palette.axis } },
         splitLine: { show: false },
       },
       yAxis: {
@@ -1026,13 +1046,13 @@ function DailySectorChart({ sector }: { sector: DailySectorSeries }) {
         nameLocation: 'middle',
         nameRotate: 90,
         nameGap: 38,
-        nameTextStyle: { color: '#94a3b8', fontSize: 10 },
-        axisLabel: { color: '#94a3b8', fontSize: 10 },
-        splitLine: { lineStyle: { color: '#e2e8f0', opacity: 0.45 } },
+        nameTextStyle: { color: palette.muted, fontSize: 10 },
+        axisLabel: { color: palette.muted, fontSize: 10 },
+        splitLine: { lineStyle: { color: palette.grid, opacity: 0.45 } },
       },
       series: [barSeries],
     }
-  }, [sector])
+  }, [sector, palette])
 
   useEffect(() => {
     let disposed = false
@@ -1094,6 +1114,33 @@ export default function SectorFlowPage() {
   const [loadError, setLoadError] = useState<string | null>(null)
   const [flashingEndpoints, setFlashingEndpoints] = useState<Set<string>>(() => new Set())
   const [chartMode, setChartMode] = useState<ChartMode>('main')
+  const [theme, setTheme] = useState<Theme>('dark')
+  const palette = CHART_THEMES[theme]
+  const navigateView = useCallback((mode: ChartMode) => {
+    setChartMode(mode)
+    window.history.pushState(null, '', `#${mode}`)
+  }, [])
+  const changeTheme = (nextTheme: Theme) => {
+    setTheme(nextTheme)
+    document.documentElement.classList.toggle('dark', nextTheme === 'dark')
+    document.documentElement.style.colorScheme = nextTheme
+    try { window.localStorage.setItem('capitalpulse.theme', nextTheme) } catch { /* Theme still works without storage. */ }
+  }
+
+  useEffect(() => {
+    setTheme(document.documentElement.classList.contains('dark') ? 'dark' : 'light')
+    const syncView = () => {
+      const view = window.location.hash.slice(1)
+      setChartMode(WORKSPACE_VIEWS.find((item) => item.id === view)?.id ?? 'main')
+    }
+    syncView()
+    window.addEventListener('popstate', syncView)
+    window.addEventListener('hashchange', syncView)
+    return () => {
+      window.removeEventListener('popstate', syncView)
+      window.removeEventListener('hashchange', syncView)
+    }
+  }, [])
   const [radar, setRadar] = useState<RadarData>({ source_time: null, scanned_count: 0, sectors: [] })
   const [radarFocusedCode, setRadarFocusedCode] = useState<string | null>(null)
   const selectionCodesRef = useRef<string>('')
@@ -1692,7 +1739,7 @@ export default function SectorFlowPage() {
     ]))
 
     prepared.forEach(({ item, values, latest, endpoint }) => {
-      const color = latest > 0 ? POSITIVE : latest < 0 ? NEGATIVE : NEUTRAL
+      const color = latest > 0 ? palette.positive : latest < 0 ? palette.negative : palette.muted
       series.push({
         id: item.sector_code,
         name: displayName(item.sector_name),
@@ -1787,7 +1834,7 @@ export default function SectorFlowPage() {
         max: MAIN_LABEL_ANCHOR_SECONDS,
         interval: 30 * 60,
         axisLabel: {
-          color: '#94a3b8',
+          color: palette.muted,
           hideOverlap: true,
           showMinLabel: true,
           showMaxLabel: true,
@@ -1795,7 +1842,7 @@ export default function SectorFlowPage() {
             value > FULL_SESSION_SECONDS ? '' : tradingAxisLabel(value)
           ),
         },
-        axisLine: { lineStyle: { color: '#cbd5e1' } },
+        axisLine: { lineStyle: { color: palette.axis } },
         splitLine: { show: false },
       },
       yAxis: {
@@ -1806,13 +1853,13 @@ export default function SectorFlowPage() {
         nameLocation: 'middle',
         nameRotate: 90,
         nameGap: 48,
-        nameTextStyle: { color: '#94a3b8' },
-        axisLabel: { color: '#94a3b8', formatter: (value: number) => value.toFixed(1) },
-        splitLine: { lineStyle: { color: '#e2e8f0', opacity: 0.55 } },
+        nameTextStyle: { color: palette.muted },
+        axisLabel: { color: palette.muted, formatter: (value: number) => value.toFixed(1) },
+        splitLine: { lineStyle: { color: palette.grid, opacity: 0.55 } },
       },
       series,
     }
-  }, [flashingEndpoints, history.series, latestByCode, visibleCodes])
+  }, [flashingEndpoints, history.series, latestByCode, visibleCodes, palette])
 
   useEffect(() => {
     chartOptionRef.current = chartOption
@@ -1905,134 +1952,90 @@ export default function SectorFlowPage() {
     && !!history.status.last_source_time
     && Date.now() / 1000 - history.status.last_source_time > 30
 
+  const activeView = WORKSPACE_VIEWS.find((view) => view.id === chartMode)!
+  const mainTotal = aggregates.main_net ?? 0
+  const flowScale = Math.max(1, ...FLOW_METRICS.map(([key]) => Math.abs(aggregates[key] ?? 0)))
+  const leaderPoints = history.series.find((series) => series.sector_code === leader?.sector_code)?.points ?? []
+  const rankedSectors = [...visibleLatest].sort((a, b) => b.main_net - a.main_net)
+  const viewNotice = chartMode === 'stock' ? stockError : (
+    loadError || activeViewError || history.status.universe_warning || history.status.last_error || history.status.backfill_error
+    || (isDelayed ? '数据源更新时间超过30秒，当前显示最近可用数据。' : null)
+  )
+
   return (
-    <main className="min-h-screen bg-slate-50 text-slate-950 dark:bg-slate-950 dark:text-slate-100">
-      <header className="sticky top-0 z-30 border-b border-slate-200 bg-white/90 backdrop-blur dark:border-slate-800 dark:bg-slate-950/90">
-        <div className="mx-auto flex max-w-[1800px] items-center gap-3 px-4 py-3">
-          <div className="flex min-w-0 items-center gap-2">
-            <h1 className="truncate text-base font-semibold sm:text-lg">行业板块资金流向</h1>
-          </div>
+    <ThemeContext.Provider value={theme}>
+    <main className="workbench">
+      <aside className="workspace-sidebar">
+        <a className="brand" href="#main" onClick={() => setChartMode('main')} aria-label="CapitalPulse 资金总览">
+          <span className="brand-mark"><Activity size={23} strokeWidth={2.4} /></span>
+          <span><strong>A · Flow</strong><small>资金流动 · A 股工作台</small></span>
+        </a>
+        <div className="nav-section-label">研究工作台 <span>WORKSPACE</span></div>
+        <nav className="workspace-navigation" aria-label="主要功能">
+          {WORKSPACE_VIEWS.map(({ id, label, icon: Icon }) => (
+            <button type="button" key={id} onClick={() => navigateView(id)} aria-current={chartMode === id ? 'page' : undefined} className={`nav-item ${chartMode === id ? 'is-active' : ''}`}>
+              <Icon size={18} strokeWidth={1.7} /><span>{label}</span>
+              {id === 'radar' && <span className="nav-tag">{history.status.market_status === 'open' ? 'LIVE' : '15s'}</span>}
+              {chartMode === id && <span className="nav-active-dot" />}
+            </button>
+          ))}
+        </nav>
+        <div className="sidebar-market-note">
+          <span className="eyebrow">MARKET FLOW</span>
+          <div><span className={`status-dot ${history.status.market_status === 'open' ? 'is-live' : ''}`} />{statusLabel(history.status.market_status)}</div>
+          <p>{history.status.market_status === 'closed' ? '收盘后保留当日资金轨迹，等待下一交易日。' : '跟随资金流向，观察市场每一次变化。'}</p>
         </div>
-      </header>
-
-      <div className="mx-auto max-w-[1800px] space-y-3 px-3 py-3 sm:px-4">
-        {(loadError || activeViewError || isDelayed || history.status.last_error || history.status.backfill_error || history.status.universe_warning) && (
-          <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300">
-            <CircleAlert className="mt-0.5 size-4 shrink-0" />
-            <span>{loadError || activeViewError || history.status.universe_warning || history.status.last_error || history.status.backfill_error || '数据源更新时间超过30秒，曲线可能暂时停滞。'}</span>
+        <div className="sidebar-footer">
+          <div className="theme-control" role="group" aria-label="界面主题">
+            <button type="button" onClick={() => changeTheme('light')} aria-pressed={theme === 'light'}><Sun size={15} />Light</button>
+            <button type="button" onClick={() => changeTheme('dark')} aria-pressed={theme === 'dark'}><Moon size={15} />Dark</button>
           </div>
-        )}
+          <div className="sidebar-footnote"><span className="brand-mini">A</span><div>A · Flow<small>专注资金，洞察轮动</small></div></div>
+        </div>
+      </aside>
 
-        <div className="grid items-start gap-3 lg:grid-cols-[250px_minmax(0,1fr)]">
-          <aside className="grid grid-cols-2 gap-2 sm:grid-cols-4 lg:sticky lg:top-20 lg:grid-cols-1">
-            <MetricCard
-              title="净流入 / 净流出"
-              value={`${inflowCount} / ${outflowCount}`}
-              detail={history.status.universe_count ? '实时流入前15 / 流出前15' : '等待全行业名单，暂显示历史板块'}
-            />
-            <MetricCard
-              title="当前最强行业"
-              value={leader ? displayName(leader.sector_name) : '--'}
-              detail={leader ? formatYi(leader.main_net) : '等待交易数据'}
-              positive={leader ? leader.main_net >= 0 : undefined}
-            />
-            <MetricCard
-              title="市场状态"
-              value={statusLabel(history.status.market_status)}
-              detail={`源时间 ${formatTime(history.status.last_source_time)}`}
-            />
-            {FLOW_METRICS.map(([key, label]) => {
-              const value = aggregates[key] || 0
-              return (
-                <div key={key} className="rounded-xl border border-slate-200 bg-white p-3 shadow-sm dark:border-slate-800 dark:bg-slate-900">
-                  <p className="text-xs text-slate-500">{label}净流入合计</p>
-                  <div className="mt-2 flex items-center justify-between">
-                    <span className={`font-mono text-base font-semibold ${value >= 0 ? 'text-red-600' : 'text-emerald-600'}`}>
-                      {formatYi(value)}
-                    </span>
-                    {value >= 0 ? <TrendingUp className="size-4 text-red-500" /> : <TrendingDown className="size-4 text-emerald-500" />}
-                  </div>
-                </div>
-              )
-            })}
-          </aside>
+      <div className="workspace-main">
+        <header className="workspace-topbar">
+          <div className="breadcrumb"><span>工作台</span><ChevronRight size={13} /><strong>{activeView.label}</strong></div>
+          <div className="topbar-actions">
+            <button type="button" className="workspace-search" onClick={() => { navigateView('stock'); setTimeout(() => document.querySelector<HTMLInputElement>('[aria-label="搜索股票名称或代码"]')?.focus(), 80) }}><Search size={16} /><span>搜索股票名称或代码</span></button>
+            <span className="market-chip"><span className="status-dot" />A 股市场</span>
+          </div>
+        </header>
 
-          <section className="min-w-0 overflow-hidden rounded-2xl border border-slate-200 bg-white shadow-sm dark:border-slate-800 dark:bg-slate-900">
-            <div className="flex flex-wrap items-start justify-between gap-3 border-b border-slate-100 px-4 py-3 dark:border-slate-800">
-              <div className="inline-flex rounded-lg bg-slate-100 p-1 dark:bg-slate-800" role="group" aria-label="资金曲线视图">
-                <button
-                  type="button"
-                  onClick={() => setChartMode('main')}
-                  aria-pressed={chartMode === 'main'}
-                  className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
-                    chartMode === 'main'
-                      ? 'bg-white text-slate-900 shadow-sm dark:bg-slate-700 dark:text-white'
-                      : 'text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white'
-                  }`}
-                >
-                  主力资金累计
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setChartMode('radar')}
-                  aria-pressed={chartMode === 'radar'}
-                  className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
-                    chartMode === 'radar'
-                      ? 'bg-white text-slate-900 shadow-sm dark:bg-slate-700 dark:text-white'
-                      : 'text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white'
-                  }`}
-                >
-                  异动雷达
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setChartMode('detail')}
-                  aria-pressed={chartMode === 'detail'}
-                  className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
-                    chartMode === 'detail'
-                      ? 'bg-white text-slate-900 shadow-sm dark:bg-slate-700 dark:text-white'
-                      : 'text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white'
-                  }`}
-                >
-                  行业细分流向
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setChartMode('daily')}
-                  aria-pressed={chartMode === 'daily'}
-                  className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
-                    chartMode === 'daily'
-                      ? 'bg-white text-slate-900 shadow-sm dark:bg-slate-700 dark:text-white'
-                      : 'text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white'
-                  }`}
-                >
-                  30日主力流向
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setChartMode('stock')}
-                  aria-pressed={chartMode === 'stock'}
-                  className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors ${
-                    chartMode === 'stock'
-                      ? 'bg-white text-slate-900 shadow-sm dark:bg-slate-700 dark:text-white'
-                      : 'text-slate-500 hover:text-slate-900 dark:text-slate-400 dark:hover:text-white'
-                  }`}
-                >
-                  个股资金流向
-                </button>
-              </div>
+        <div className="workspace-content">
+          <div className="page-heading">
+            <div><p className="eyebrow">{activeView.english}</p><h1>{activeView.label}<span className="heading-dot">.</span></h1><p className="page-description">{activeView.description}</p></div>
+            <div className="session-summary"><span className={`session-pill ${history.status.market_status === 'open' ? 'is-live' : ''}`}><span className="status-dot" />{statusLabel(history.status.market_status)}</span><span><Clock3 size={13} />{history.trade_date || '--'} · {formatTime(history.status.last_source_time)}</span></div>
+          </div>
+
+          {viewNotice && <div className="workspace-notice" role="status"><CircleAlert size={15} /><span>{viewNotice}</span><span className="notice-tag">数据状态</span></div>}
+
+          {chartMode === 'main' && (
+            <section className="overview-grid" aria-label="市场资金概览">
+              <article className="overview-card balance-card">
+                <div className="card-eyebrow"><span>主力净流入</span><Activity size={16} /></div>
+                <div className={`overview-number ${mainTotal >= 0 ? 'flow-positive' : 'flow-negative'}`}>{formatYi(mainTotal)}<span>CNY</span></div>
+                <p className="overview-caption">当前展示 {visibleSelection.length} 个板块合计</p>
+                <div className="balance-footer"><span><ArrowUpRight size={14} />净流入 <b>{inflowCount}</b></span><span><ArrowDownLeft size={14} />净流出 <b>{outflowCount}</b></span><span className="subtle-tag">{history.status.universe_count ? '动态 15 + 15' : '历史快照'}</span></div>
+              </article>
+              <article className="overview-card leader-card">
+                <div className="card-eyebrow"><span>资金领先板块</span><span className="subtle-tag purple">TOP SECTOR</span></div>
+                <div className="leader-body"><div><h2>{leader ? displayName(leader.sector_name) : '--'}</h2><span className={leader && leader.main_net >= 0 ? 'flow-positive' : 'flow-negative'}>{leader ? formatYi(leader.main_net) : '--'}</span></div><MiniSparkline points={leaderPoints} positive={!leader || leader.main_net >= 0} /></div>
+                <div className="leader-footer"><span>当日累计资金走势</span><span>截至 {formatTime(leader?.source_time)}</span></div>
+              </article>
+              <article className="overview-card structure-card">
+                <div className="card-eyebrow"><span>资金结构</span><span className="muted">当前板块合计</span></div>
+                <div className="structure-bars">{FLOW_METRICS.map(([key, label]) => { const value = aggregates[key] ?? 0; return <div className="structure-row" key={key}><span>{label}</span><div className="structure-track"><i style={{ width: `${Math.max(2, Math.abs(value) / flowScale * 100)}%`, background: value >= 0 ? 'var(--flow-positive)' : 'var(--flow-negative)' }} /></div><strong className={value >= 0 ? 'flow-positive' : 'flow-negative'}>{formatYi(value)}</strong></div> })}</div>
+              </article>
+            </section>
+          )}
+
+          <div className="view-layout">
+          <section className="workspace-panel">
+            <div className="workspace-panel-header">
+              <div className="panel-title"><span className="panel-title-icon"><activeView.icon size={17} /></span><div><span className="eyebrow">{chartMode === 'main' ? 'INTRADAY CAPITAL FLOW' : activeView.english}</span><h2>{chartMode === 'main' ? '主力资金累计' : activeView.label}</h2></div></div>
               <div className="min-w-0 text-right">
-                <h2 className="font-medium">
-                  {chartMode === 'main'
-                    ? '主力资金累计曲线'
-                    : chartMode === 'radar'
-                      ? '全行业短线异动雷达'
-                    : chartMode === 'detail'
-                      ? '行业细分资金流向'
-                      : chartMode === 'daily'
-                        ? '30日主力资金流向曲线'
-                        : '个股实时资金流向'}
-                </h2>
                 {chartMode === 'main' || chartMode === 'daily' || chartMode === 'radar' ? (
                   <div className="mt-1 flex flex-wrap items-center justify-end gap-3 text-xs text-slate-500">
                     <span className="flex items-center gap-1"><span className="size-2 rounded-full bg-red-600" />净流入</span>
@@ -2070,7 +2073,12 @@ export default function SectorFlowPage() {
                   <span>源时间 {formatTime(radar.source_time)}</span>
                 </div>
                 {radar.sectors.length === 0 ? (
-                  <div className="flex h-64 items-center justify-center text-sm text-slate-500">{history.status.universe_warning || '等待全行业实时快照…'}</div>
+                  <div className="radar-empty">
+                    <div className="radar-empty-icon"><Radar size={38} strokeWidth={1.2} /></div>
+                    <h3>{history.status.market_status === 'closed' ? '休市期间暂停异动监测' : '等待市场的下一次脉冲'}</h3>
+                    <p>盘中扫描全部可用二级行业，捕捉短时资金变化与由负转正。</p>
+                    <div className="radar-window-labels"><span>15 秒 · 短时变化</span><span>1 分钟 · 资金方向</span><span>3 分钟 · 持续性</span></div>
+                  </div>
                 ) : (
                   <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
                     <div className="grid gap-4 lg:grid-cols-3">
@@ -2144,8 +2152,9 @@ export default function SectorFlowPage() {
               </div>
             )}
 
-            <div className={chartMode === 'main' ? 'flex min-h-[480px] flex-col xl:flex-row' : 'hidden'}>
-              <div className="relative h-[480px] min-h-[420px] min-w-0 flex-1 sm:h-[560px] lg:h-[640px]">
+            {chartMode === 'main' && <div className="chart-scroll-hint">左右滑动，查看完整资金曲线 <ArrowUpRight size={12} /></div>}
+            <div className={chartMode === 'main' ? 'main-chart-layout flex min-h-[480px] flex-col xl:flex-row' : 'hidden'}>
+              <div className="main-chart-canvas">
                 <div ref={chartContainer} className="absolute inset-0" aria-label="行业主力资金实时曲线" />
                 {!loading && history.series.length > 0 && (
                   <div className="pointer-events-none absolute left-[76px] top-2 z-10 flex max-w-[calc(100%-90px)] flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border border-slate-200 bg-white/95 px-3 py-1.5 text-xs shadow-sm backdrop-blur-sm sm:left-[150px] sm:max-w-[calc(100%-164px)] dark:border-slate-700 dark:bg-slate-900/95">
@@ -2218,7 +2227,7 @@ export default function SectorFlowPage() {
                       <button
                         key={stock.quote_id}
                         type="button"
-                        onClick={() => { chooseStock(stock); setChartMode('stock') }}
+                        onClick={() => { chooseStock(stock); navigateView('stock') }}
                         className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2.5 text-left transition-colors hover:border-slate-400 hover:bg-slate-50 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-slate-500 dark:border-slate-700 dark:bg-slate-900 dark:hover:border-slate-500"
                         aria-label={`查看${stock.name}个股资金曲线`}
                       >
@@ -2395,8 +2404,9 @@ export default function SectorFlowPage() {
 
             {chartMode === 'stock' && (
               <div className="flex h-[480px] min-h-[420px] flex-col bg-slate-50 sm:h-[560px] lg:h-[640px] dark:bg-slate-950/40">
-                <div className="flex flex-wrap items-center gap-3 border-b border-slate-200 px-4 py-3 dark:border-slate-800">
-                  <div className="relative min-w-[240px] flex-1 sm:max-w-md">
+                <div className="stock-toolbar flex flex-wrap items-center gap-3 border-b border-slate-200 px-4 py-3 dark:border-slate-800">
+                  <div className="stock-search relative min-w-[240px] flex-1 sm:max-w-md">
+                    <Search className="stock-search-icon" size={16} />
                     <input
                       type="search"
                       value={stockQuery}
@@ -2464,6 +2474,7 @@ export default function SectorFlowPage() {
                   </div>
                 </div>
 
+                {selectedStock && <div className="stock-context-bar"><div className="stock-identity"><span className="stock-avatar">{selectedStock.name.slice(0, 1)}</span><div><h3>{selectedStock.name}</h3><span className="mono">{selectedStock.code} · {selectedStock.market_name}</span></div></div><div className="stock-main-value"><span>主力净流入</span><strong className={(stockHistory?.points.at(-1)?.[1] ?? 0) >= 0 ? 'flow-positive mono' : 'flow-negative mono'}>{stockHistory?.points.length ? formatYi(stockHistory.points.at(-1)![1]) : '--'}</strong></div></div>}
                 <div className="relative min-h-0 flex-1">
                   {selectedStock && stockHistory && stockHistory.points.length > 0 && (
                     <StockFlowChart data={stockHistory} flashing={stockFlashing} />
@@ -2492,8 +2503,25 @@ export default function SectorFlowPage() {
               </div>
             )}
           </section>
+          </div>
+
+          {chartMode === 'main' && (
+            <div className="research-grid">
+              <section className="research-card">
+                <div className="research-card-header"><h2><Bookmark size={16} />最近观察</h2><button type="button" onClick={() => navigateView('stock')}>个股研究 <ArrowUpRight size={14} /></button></div>
+                <p className="research-caption">快速回到你关注的股票</p>
+                <div className="watchlist-grid">{recentStocks.length ? recentStocks.slice(0, 4).map((stock) => <button type="button" className="watchlist-item" key={stock.quote_id} onClick={() => { chooseStock(stock); navigateView('stock') }}><span className="stock-avatar">{stock.name.slice(0, 1)}</span><strong>{stock.name}</strong><span className="mono">{stock.code}</span><span className="watchlist-link">资金走势 <ArrowUpRight size={12} /></span></button>) : <button type="button" className="watchlist-empty" onClick={() => navigateView('stock')}><Search size={20} /><span>搜索一只股票，开始观察它的资金走势</span><ArrowUpRight size={16} /></button>}</div>
+              </section>
+              <section className="research-card">
+                <div className="research-card-header"><h2><Layers3 size={16} />板块资金榜</h2><span className="subtle-tag">当日净流入</span></div>
+                <div className="sector-ranking">{rankedSectors.slice(0, 4).map((sector, index) => <button type="button" key={sector.sector_code} onClick={() => { pinnedCodeRef.current = sector.sector_code; setPinnedCode(sector.sector_code); highlightSector(sector.sector_code); document.querySelector('.workspace-panel')?.scrollIntoView({ behavior: 'smooth', block: 'start' }) }}><span className="rank-index">{String(index + 1).padStart(2, '0')}</span><strong>{displayName(sector.sector_name)}</strong><span className={sector.main_net >= 0 ? 'flow-positive mono' : 'flow-negative mono'}>{formatYi(sector.main_net)}</span><ArrowUpRight size={14} /></button>)}</div>
+              </section>
+            </div>
+          )}
+          <footer className="workspace-bottom"><span><Activity size={12} /> CAPITALPULSE</span><span>数据源：东方财富 · 资金流向仅供研究观察</span></footer>
         </div>
       </div>
     </main>
+    </ThemeContext.Provider>
   )
 }
