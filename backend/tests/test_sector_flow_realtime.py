@@ -88,18 +88,20 @@ class SectorFlowParsingTests(unittest.TestCase):
             datetime(2026, 7, 27, 9, 30, tzinfo=CST),
         ))
 
-    def test_parses_all_fields_and_defaults_missing_values(self):
+    def test_parses_complete_fields_and_rejects_missing_values(self):
         parsed = parse_snapshot_items([
             {
                 "f12": "bk0001",
                 "f14": "行业一",
                 "f62": "12.5",
                 "f66": 4,
-                "f72": None,
+                "f72": 0,
                 "f78": "-2.5",
                 "f84": "-10",
                 "f124": "1785115800",
             },
+            {"f12": "BK0003", "f62": 2, "f66": 1, "f72": None,
+             "f78": -1, "f84": -2, "f124": "1785115800"},
             {"f12": "BK0002", "f124": 0},
             "invalid",
         ])
@@ -792,10 +794,20 @@ class SectorFlowDatabaseTests(unittest.IsolatedAsyncioTestCase):
         ):
             self.assertTrue(await self.service.collect_once(current))
             self.assertFalse(await self.service.collect_once(current + timedelta(seconds=6)))
-            self.assertEqual(self.service.status_data()["market_status"], "open")
+            self.assertEqual(self.service.status_data(current + timedelta(seconds=6))["market_status"], "open")
             self.assertFalse(await self.service.collect_once(current + timedelta(seconds=15)))
         self.assertEqual(self.service.status_data()["market_status"], "stale")
         self.assertIsNone(self.service.status_data()["last_error"])
+
+    def test_status_reports_source_age_even_between_poll_attempts(self):
+        current = datetime(2026, 7, 27, 10, 0, tzinfo=CST)
+        self.service._status = "open"
+        self.service._last_source_time = int(current.timestamp()) - 12
+
+        status = self.service.status_data(current)
+
+        self.assertEqual(status["market_status"], "stale")
+        self.assertEqual(status["source_age_seconds"], 12.0)
 
     async def test_sustained_snapshot_failure_reports_error(self):
         current = datetime(2026, 7, 27, 10, 0, tzinfo=CST)

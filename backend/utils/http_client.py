@@ -59,6 +59,8 @@ async def safe_fetch(
     params: Optional[dict] = None,
     headers: Optional[dict] = None,
     force_gbk: bool = False,
+    timeout: float | None = None,
+    max_retries: int | None = None,
 ) -> Optional[str]:
     """
     Fetch text from a URL with retry and timeout.
@@ -73,13 +75,20 @@ async def safe_fetch(
         Decoded text or None on failure.
     """
     client = await get_client()
+    attempts = MAX_RETRIES if max_retries is None else max(1, max_retries)
     merged_headers = {**DEFAULT_HEADERS}
     if headers:
         merged_headers.update(headers)
 
-    for attempt in range(1, MAX_RETRIES + 1):
+    for attempt in range(1, attempts + 1):
         try:
-            resp = await client.get(url, params=params, headers=merged_headers)
+            if timeout is None:
+                resp = await client.get(url, params=params, headers=merged_headers)
+            else:
+                resp = await asyncio.wait_for(
+                    client.get(url, params=params, headers=merged_headers, timeout=timeout),
+                    timeout=timeout,
+                )
 
             if resp.status_code == 200:
                 if force_gbk:
@@ -102,16 +111,16 @@ async def safe_fetch(
 
             logger.warning(
                 "[http_client] HTTP %s for %s (attempt %d/%d)",
-                resp.status_code, url, attempt, MAX_RETRIES,
+                resp.status_code, url, attempt, attempts,
             )
 
-        except httpx.HTTPError as e:
+        except (httpx.HTTPError, asyncio.TimeoutError) as e:
             logger.warning(
-                "[http_client] Request error for %s (attempt %d/%d): %s",
-                url, attempt, MAX_RETRIES, str(e),
+                "[http_client] Request error for %s (attempt %d/%d): %s: %s",
+                url, attempt, attempts, type(e).__name__, str(e),
             )
 
-        if attempt < MAX_RETRIES:
+        if attempt < attempts:
             await asyncio.sleep(RETRY_DELAY * attempt / 1000.0)
 
     return None

@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
 import os
 import sqlite3
 from collections import deque
@@ -19,6 +20,7 @@ from database import MysqlConnection, open_database, using_mysql
 from config import (
     EASTMONEY_SECTOR_FLOW_SNAPSHOT_FALLBACK_URL,
     EASTMONEY_SECTOR_FLOW_SNAPSHOT_URL,
+    LIVE_REQUEST_TIMEOUT_SECONDS,
     env_path,
 )
 from services.sector_flow_upstream import (
@@ -57,6 +59,7 @@ DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "sector_flow_re
 DETAIL_PAGE_SIZE = 6
 SNAPSHOT_DELAY_SECONDS = 10.0
 SNAPSHOT_ALERT_SECONDS = 30.0
+MAX_FUTURE_SKEW_SECONDS = 5.0
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -95,13 +98,23 @@ def parse_snapshot_items(items: list[Any]) -> list[dict[str, Any]]:
             source_time = 0
         if not code or source_time <= 0:
             continue
+        values: dict[str, float] = {}
+        for column, field in FLOW_FIELDS.items():
+            try:
+                value = float(item.get(field))
+            except (TypeError, ValueError):
+                break
+            if not math.isfinite(value):
+                break
+            values[column] = value
+        if len(values) != len(FLOW_FIELDS):
+            continue
         flow = {
             "sector_code": code,
             "sector_name": str(item.get("f14") or ""),
             "source_time": source_time,
+            **values,
         }
-        for column, field in FLOW_FIELDS.items():
-            flow[column] = as_float(item.get(field))
         flows.append(flow)
     return flows
 
@@ -529,15 +542,18 @@ class SectorFlowRealtimeService:
             "invt": "2",
             "secids": secids,
             "fields": "f12,f14,f62,f66,f72,f78,f84,f124",
+            "_": str(int(datetime.now(CST).timestamp() * 1000)),
         }
-        for url in (
-            EASTMONEY_SECTOR_FLOW_SNAPSHOT_URL,
-            EASTMONEY_SECTOR_FLOW_SNAPSHOT_FALLBACK_URL,
+        for url, attempts in (
+            (EASTMONEY_SECTOR_FLOW_SNAPSHOT_URL, 2),
+            (EASTMONEY_SECTOR_FLOW_SNAPSHOT_FALLBACK_URL, 1),
         ):
             text = await safe_fetch(
                 url,
                 params=params,
                 headers={"Referer": "https://data.eastmoney.com/"},
+                timeout=LIVE_REQUEST_TIMEOUT_SECONDS,
+                max_retries=attempts,
             )
             if not text:
                 continue
@@ -815,6 +831,7 @@ class SectorFlowRealtimeService:
             flow
             for flow in flows
             if datetime.fromtimestamp(int(flow["source_time"]), CST).date() == current.date()
+            and int(flow["source_time"]) - current.timestamp() <= MAX_FUTURE_SKEW_SECONDS
         ]
         if not valid_flows:
             await self._set_status("stale", "上游尚未提供当天板块资金快照")
@@ -897,7 +914,7 @@ class SectorFlowRealtimeService:
         try:
             from services.signal_service import signal_service
 
-            signal_service.ingest_sector(valid_flows, current)
+            signal_service.ingest_sector(valid_flows, now or datetime.now(CST))
         except Exception:
             logger.exception("[sector-flow] Signal evaluation failed")
 
@@ -997,10 +1014,24 @@ class SectorFlowRealtimeService:
         if changed:
             await self.broadcast({"type": "status", "data": self.status_data()})
 
-    def status_data(self) -> dict[str, Any]:
+    def status_data(self, now: datetime | None = None) -> dict[str, Any]:
+        now = now or datetime.now(CST)
+        source_age = (
+            now.timestamp() - self._last_source_time
+            if self._last_source_time is not None else None
+        )
+        status = self._status
+        if (
+            market_status_at(now) == "open"
+            and status == "open"
+            and (source_age is None or source_age > SNAPSHOT_DELAY_SECONDS
+                 or source_age < -MAX_FUTURE_SKEW_SECONDS)
+        ):
+            status = "stale"
         return {
-            "market_status": self._status,
+            "market_status": status,
             "last_source_time": self._last_source_time,
+            "source_age_seconds": round(source_age, 1) if source_age is not None else None,
             "last_received_at": self._last_received_at,
             "selected_count": len(self._selection),
             "universe_count": len(self._universe),

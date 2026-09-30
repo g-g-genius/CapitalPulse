@@ -20,6 +20,7 @@ from services.sector_flow_realtime import (
     CST,
     DEFAULT_DB_PATH,
     FLOW_COLUMNS,
+    MAX_FUTURE_SKEW_SECONDS,
     MORNING_START,
     market_status_at,
     minute_source_time,
@@ -32,6 +33,7 @@ from services.stock_flow_upstream import (
 from utils.sector_selection import as_float
 
 logger = logging.getLogger(__name__)
+STOCK_SNAPSHOT_DELAY_SECONDS = 10.0
 
 
 class StockFlowRealtimeService:
@@ -48,6 +50,8 @@ class StockFlowRealtimeService:
         self._backfill_tasks: dict[str, asyncio.Task[None]] = {}
         self._stock_meta: dict[str, dict[str, str]] = {}
         self._last_signatures: dict[str, tuple[Any, ...]] = {}
+        self._last_source_times: dict[str, int] = {}
+        self._last_statuses: dict[str, str] = {}
         self._backfill_locks: dict[str, asyncio.Lock] = {}
         self._backfilled_minutes: dict[tuple[date, str], int] = {}
 
@@ -114,6 +118,8 @@ class StockFlowRealtimeService:
         self._backfill_tasks.clear()
         self._backfill_locks.clear()
         self._backfilled_minutes.clear()
+        self._last_source_times.clear()
+        self._last_statuses.clear()
         for clients in self._clients.values():
             for client in clients:
                 with contextlib.suppress(Exception):
@@ -314,6 +320,16 @@ class StockFlowRealtimeService:
         if rows:
             code = str(rows[-1][1])
             name = str(rows[-1][2])
+        latest_source_time = int(rows[-1][0]) if rows else None
+        now = datetime.now(CST)
+        status = market_status_at(now)
+        if status == "open" and (
+            latest_source_time is None
+            or not -MAX_FUTURE_SKEW_SECONDS
+            <= now.timestamp() - latest_source_time
+            <= STOCK_SNAPSHOT_DELAY_SECONDS
+        ):
+            status = "stale"
         return {
             "runtime_id": self.runtime_id,
             "trade_date": trade_date.isoformat(),
@@ -330,20 +346,35 @@ class StockFlowRealtimeService:
                 for row in rows
             ],
             "poll_seconds": self.poll_seconds,
-            "market_status": market_status_at(datetime.now(CST)),
+            "market_status": status,
         }
+
+    def _current_status(self, quote_id: str, now: datetime) -> str:
+        status = market_status_at(now)
+        if status != "open":
+            return status
+        source_time = self._last_source_times.get(quote_id)
+        if source_time is None:
+            return "stale"
+        age = now.timestamp() - source_time
+        return "open" if -MAX_FUTURE_SKEW_SECONDS <= age <= STOCK_SNAPSHOT_DELAY_SECONDS else "stale"
 
     async def collect_once(
         self,
         quote_id: str,
         now: datetime | None = None,
     ) -> bool:
-        current = now or datetime.now(CST)
         data = await fetch_stock_flow_snapshot(quote_id)
+        current = now or datetime.now(CST)
         if not data or int(data.get("source_time") or 0) <= 0:
             return False
         source_time = int(data["source_time"])
-        if datetime.fromtimestamp(source_time, CST).date() != current.date():
+        if (
+            datetime.fromtimestamp(source_time, CST).date() != current.date()
+            or not -MAX_FUTURE_SKEW_SECONDS
+            <= current.timestamp() - source_time
+            <= STOCK_SNAPSHOT_DELAY_SECONDS
+        ):
             return False
         meta = self._stock_meta.get(quote_id, {})
         data["code"] = str(data.get("code") or meta.get("code") or "")
@@ -357,6 +388,7 @@ class StockFlowRealtimeService:
             return False
         self._persist_snapshot(current.date(), data)
         self._last_signatures[quote_id] = signature
+        self._last_source_times[quote_id] = source_time
         await self._broadcast(quote_id, {"type": "update", "data": data})
         return True
 
@@ -384,17 +416,24 @@ class StockFlowRealtimeService:
                 status = market_status_at(now)
                 if status == "open":
                     try:
-                        await self.collect_once(quote_id, now)
+                        await self.collect_once(quote_id)
                     except asyncio.CancelledError:
                         raise
                     except Exception:
                         logger.exception("[stock-flow] Poll failed for %s", quote_id)
+                    status = self._current_status(quote_id, datetime.now(CST))
+                    if status != self._last_statuses.get(quote_id):
+                        self._last_statuses[quote_id] = status
+                        await self._broadcast(
+                            quote_id, {"type": "status", "data": {"market_status": status}},
+                        )
                     await asyncio.sleep(self.poll_seconds)
                 else:
-                    await self._broadcast(
-                        quote_id,
-                        {"type": "status", "data": {"market_status": status}},
-                    )
+                    if status != self._last_statuses.get(quote_id):
+                        self._last_statuses[quote_id] = status
+                        await self._broadcast(
+                            quote_id, {"type": "status", "data": {"market_status": status}},
+                        )
                     await asyncio.sleep(15.0)
         finally:
             self._tasks.pop(quote_id, None)
@@ -413,9 +452,13 @@ class StockFlowRealtimeService:
         clients = self._clients.setdefault(quote_id, set())
         clients.add(websocket)
         self._stock_meta[quote_id] = {"code": code, "name": name}
+        snapshot = self.history_data(datetime.now(CST).date(), quote_id, code, name)
+        if snapshot["points"]:
+            self._last_source_times[quote_id] = snapshot["points"][-1][0]
+        self._last_statuses[quote_id] = snapshot["market_status"]
         await websocket.send_json({
             "type": "snapshot",
-            "data": self.history_data(datetime.now(CST).date(), quote_id, code, name),
+            "data": snapshot,
         })
         if quote_id not in self._tasks:
             self._tasks[quote_id] = asyncio.create_task(
@@ -434,7 +477,7 @@ class StockFlowRealtimeService:
                 except asyncio.TimeoutError:
                     await websocket.send_json({
                         "type": "heartbeat",
-                        "data": {"market_status": market_status_at(datetime.now(CST))},
+                        "data": {"market_status": self._current_status(quote_id, datetime.now(CST))},
                     })
         except WebSocketDisconnect:
             pass
@@ -444,6 +487,7 @@ class StockFlowRealtimeService:
             clients.discard(websocket)
             if not clients:
                 self._clients.pop(quote_id, None)
+                self._last_statuses.pop(quote_id, None)
                 task = self._tasks.get(quote_id)
                 if task and not task.done():
                     task.cancel()

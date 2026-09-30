@@ -10,9 +10,10 @@ from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import HOST, PORT
-from routers import auth, sector_flow_realtime, signals, stock_flow_realtime, watchlist
+from routers import auth, market_stock_radar as market_stock_radar_router, sector_flow_realtime, signals, stock_flow_realtime, watchlist
 from services.auth_service import auth_service
 from services.sector_flow_realtime import sector_flow_service
+from services.market_stock_radar import market_stock_radar
 from services.signal_service import signal_service
 from services.stock_flow_realtime import stock_flow_service
 from utils.http_client import close_client
@@ -34,8 +35,10 @@ async def lifespan(app: FastAPI):
     await sector_flow_service.start()
     await stock_flow_service.start()
     await signal_service.start()
+    await market_stock_radar.start()
     yield
     logger.info("backend shutting down...")
+    await market_stock_radar.stop()
     await signal_service.stop()
     await stock_flow_service.stop()
     await sector_flow_service.stop()
@@ -67,6 +70,7 @@ app.add_middleware(
 
 app.include_router(sector_flow_realtime.router, prefix="/api", tags=["Real-time Sector Flow"])
 app.include_router(stock_flow_realtime.router, prefix="/api", tags=["Real-time Stock Flow"])
+app.include_router(market_stock_radar_router.router, prefix="/api", tags=["Stock Radar"])
 app.include_router(auth.router, prefix="/api", tags=["Account"])
 app.include_router(watchlist.router, prefix="/api", tags=["Watchlist"])
 app.include_router(signals.router, prefix="/api", tags=["Signals"])
@@ -76,7 +80,14 @@ app.include_router(signals.router, prefix="/api", tags=["Signals"])
 @app.get("/api/health")
 async def health_check():
     """Health check endpoint."""
-    return {"code": 200, "msg": "ok", "data": {"status": "healthy"}}
+    return {
+        "code": 200,
+        "msg": "ok",
+        "data": {
+            "status": "healthy",
+            "sector_flow": sector_flow_service.status_data(),
+        },
+    }
 
 
 @app.websocket("/ws/sector-flow")

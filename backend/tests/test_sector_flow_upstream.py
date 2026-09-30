@@ -164,8 +164,10 @@ class SectorFlowUpstreamTests(unittest.IsolatedAsyncioTestCase):
     async def test_batch_snapshot_keeps_only_requested_a_share_quote_ids(self):
         payload = json.dumps({"data": {"diff": [
             {"f12": "600519", "f13": 1, "f14": "贵州茅台", "f2": 1888.8,
-             "f3": 1.25, "f62": 20, "f124": 1785903000},
-            {"f12": "000001", "f13": 0, "f14": "平安银行", "f62": -10, "f124": 1785903000},
+             "f3": 1.25, "f62": 20, "f66": 8, "f72": 12,
+             "f78": -5, "f84": -15, "f124": 1785903000},
+            {"f12": "000001", "f13": 0, "f14": "平安银行", "f62": -10,
+             "f66": -4, "f72": -6, "f78": 2, "f84": 8, "f124": 1785903000},
             {"f12": "300001", "f13": 0, "f14": "其他", "f62": 2, "f124": 1785903000},
         ]}})
         fetch = AsyncMock(return_value=payload)

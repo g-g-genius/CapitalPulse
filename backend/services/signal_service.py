@@ -15,7 +15,9 @@ from typing import Any
 
 from config import env_path
 from database import MysqlConnection, open_database
-from services.sector_flow_realtime import CST, DEFAULT_DB_PATH, market_status_at
+from services.sector_flow_realtime import (
+    CST, DEFAULT_DB_PATH, MAX_FUTURE_SKEW_SECONDS, market_status_at,
+)
 from services.signal_engine import SignalEngine
 from services.stock_flow_upstream import fetch_stock_flow_snapshots
 
@@ -117,7 +119,7 @@ class SignalService:
         self._persist_pending()
         for flow in flows:
             source_time = int(flow["source_time"])
-            if not 0 <= current.timestamp() - source_time <= MAX_SOURCE_AGE_SECONDS:
+            if not -MAX_FUTURE_SKEW_SECONDS <= current.timestamp() - source_time <= MAX_SOURCE_AGE_SECONDS:
                 continue
             self._pending_events.extend(self._engine.evaluate(
                 "sector", str(flow["sector_code"]), str(flow["sector_name"]),
@@ -131,7 +133,7 @@ class SignalService:
         self._persist_pending()
         for flow in flows:
             source_time = int(flow["source_time"])
-            if not 0 <= current.timestamp() - source_time <= MAX_SOURCE_AGE_SECONDS:
+            if not -MAX_FUTURE_SKEW_SECONDS <= current.timestamp() - source_time <= MAX_SOURCE_AGE_SECONDS:
                 continue
             self._pending_events.extend(self._engine.evaluate(
                 "stock", str(flow["quote_id"]), str(flow["name"]),
@@ -287,7 +289,7 @@ class SignalService:
                 quote_id = str(flow["quote_id"])
                 if (
                     datetime.fromtimestamp(source_time, CST).date() != current.date()
-                    or not 0 <= current.timestamp() - source_time <= MAX_SOURCE_AGE_SECONDS
+                    or not -MAX_FUTURE_SKEW_SECONDS <= current.timestamp() - source_time <= MAX_SOURCE_AGE_SECONDS
                     or source_time <= self._last_stock_source.get(quote_id, 0)
                 ):
                     continue

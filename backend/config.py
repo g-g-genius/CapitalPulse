@@ -32,6 +32,7 @@ def env_path(name: str, default: Path) -> Path:
     return BACKEND_DIR / path
 
 REQUEST_TIMEOUT = 10.0
+LIVE_REQUEST_TIMEOUT_SECONDS = 2.5
 MAX_RETRIES = 2
 RETRY_DELAY = 500
 

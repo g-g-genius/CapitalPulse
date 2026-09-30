@@ -1,6 +1,6 @@
 import tempfile
 import unittest
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -90,6 +90,18 @@ class StockFlowRealtimeTests(unittest.IsolatedAsyncioTestCase):
             "SELECT COUNT(*) FROM stock_flow_snapshot"
         ).fetchone()[0]
         self.assertEqual(count, 0)
+
+    async def test_same_day_delayed_snapshot_is_not_broadcast_as_live(self):
+        current = datetime(2026, 8, 5, 10, 0, tzinfo=CST)
+        stale = make_stock_flow(int((current - timedelta(seconds=30)).timestamp()))
+        with (
+            patch("services.stock_flow_realtime.fetch_stock_flow_snapshot",
+                  new=AsyncMock(return_value=stale)),
+            patch.object(self.service, "_broadcast", new=AsyncMock()) as broadcast,
+        ):
+            self.assertFalse(await self.service.collect_once("1.600519", current))
+        self.assertEqual(self.service._current_status("1.600519", current), "stale")
+        broadcast.assert_not_awaited()
 
     async def test_backfill_adds_prior_minutes_without_replacing_live_seconds(self):
         current = datetime(2026, 8, 5, 10, 30, 20, tzinfo=CST)

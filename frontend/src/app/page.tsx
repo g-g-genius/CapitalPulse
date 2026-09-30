@@ -33,6 +33,7 @@ import {
 } from 'lucide-react'
 import AuthEntry from './components/AuthEntry'
 import SignalCenter from './components/SignalCenter'
+import StockRadar from './components/StockRadar'
 
 type Flow = {
   sector_code: string
@@ -252,7 +253,7 @@ function mergeDailyHistory(
   }
 }
 
-type ChartMode = 'main' | 'radar' | 'signals' | 'detail' | 'daily' | 'stock' | 'watchlist'
+type ChartMode = 'main' | 'radar' | 'stock-radar' | 'signals' | 'detail' | 'daily' | 'stock' | 'watchlist'
 type Theme = 'light' | 'dark'
 const ThemeContext = createContext<Theme>('dark')
 const CHART_THEMES = {
@@ -263,6 +264,7 @@ const CHART_THEMES = {
 const WORKSPACE_VIEWS = [
   { id: 'main', label: '资金总览', description: '观察资金方向，跟踪板块轮动。', icon: LayoutDashboard, english: 'MARKET OVERVIEW' },
   { id: 'radar', label: '异动雷达', description: '从短时资金变化中，发现正在启动的板块。', icon: Radar, english: 'MOMENTUM RADAR' },
+  { id: 'stock-radar', label: '个股异动', description: '扫描全市场 A 股，追踪短时主力资金变化。', icon: Activity, english: 'STOCK RADAR' },
   { id: 'signals', label: '异动提醒', description: '接收板块与自选股的短时资金信号，按交易日复盘。', icon: BellRing, english: 'SIGNAL CENTER' },
   { id: 'detail', label: '行业细分', description: '拆解不同订单规模的资金流向。', icon: Layers3, english: 'SECTOR ANALYSIS' },
   { id: 'daily', label: '30日资金', description: '拉长时间，看清板块资金的持续性。', icon: BarChart3, english: 'CAPITAL TRENDS' },
@@ -1215,6 +1217,7 @@ export default function SectorFlowPage() {
   const [stockSelectionReady, setStockSelectionReady] = useState(false)
   const [stockHistory, setStockHistory] = useState<StockFlowHistory | null>(null)
   const [stockMarketStatus, setStockMarketStatus] = useState<ServiceStatus['market_status']>('closed')
+  const [nowSeconds, setNowSeconds] = useState(() => Date.now() / 1000)
   const [stockError, setStockError] = useState<string | null>(null)
   const [stockFlashing, setStockFlashing] = useState(false)
   const [watchlist, setWatchlist] = useState<WatchlistStock[]>([])
@@ -1224,6 +1227,11 @@ export default function SectorFlowPage() {
   const [watchlistQuotes, setWatchlistQuotes] = useState<Record<string, WatchlistQuote>>({})
   const [watchlistQuoteError, setWatchlistQuoteError] = useState<string | null>(null)
   const [watchlistQuoteLoading, setWatchlistQuoteLoading] = useState(false)
+
+  useEffect(() => {
+    const interval = window.setInterval(() => setNowSeconds(Date.now() / 1000), 3000)
+    return () => window.clearInterval(interval)
+  }, [])
 
   const loadWatchlist = useCallback(async (signal?: AbortSignal) => {
     setWatchlistStatus('loading')
@@ -1462,6 +1470,12 @@ export default function SectorFlowPage() {
     }
     socket.onclose = () => {
       socketRef.current = null
+      setHistory((current) => ({
+        ...current,
+        status: current.status.market_status === 'open'
+          ? { ...current.status, market_status: 'stale' }
+          : current.status,
+      }))
       const delay = Math.min(1000 * 2 ** reconnectAttempts.current, 15000)
       reconnectAttempts.current += 1
       reconnectTimer.current = setTimeout(connectSocket, delay)
@@ -1690,6 +1704,7 @@ export default function SectorFlowPage() {
       socket.onclose = () => {
         if (stockSocketRef.current === socket) stockSocketRef.current = null
         if (disposed) return
+        setStockMarketStatus((current) => current === 'open' ? 'stale' : current)
         setStockError('个股实时连接已断开，正在重连…')
         const delay = Math.min(1000 * 2 ** reconnectAttempts, 15000)
         reconnectAttempts += 1
@@ -1802,6 +1817,7 @@ export default function SectorFlowPage() {
     setCandidateLoading(true)
     void fetch(`/api/finance/sector-flow/candidates?sector_code=${encodeURIComponent(sectorCode)}&limit=5`, {
       signal: controller.signal,
+      cache: 'no-store',
     }).then(async (response) => {
       if (!response.ok) throw new Error('请求失败')
       const payload = await response.json() as { code: number; data: SectorCandidateData | null }
@@ -2125,10 +2141,17 @@ export default function SectorFlowPage() {
       : chartMode === 'stock'
         ? stockError
         : null
-  const isDelayed = (history.status.market_status === 'stale'
-    || history.status.market_status === 'open')
-    && !!history.status.last_source_time
-    && Date.now() / 1000 - history.status.last_source_time > 30
+  const isDelayed = history.status.market_status === 'stale'
+    || (history.status.market_status === 'open'
+      && !!history.status.last_source_time
+      && nowSeconds - history.status.last_source_time > 10)
+  const sectorMarketStatus = history.status.market_status === 'open' && isDelayed
+    ? 'stale'
+    : history.status.market_status
+  const stockDisplayStatus = stockMarketStatus === 'open'
+    && (!stockLastTime || nowSeconds - stockLastTime > 10)
+    ? 'stale'
+    : stockMarketStatus
 
   const activeView = WORKSPACE_VIEWS.find((view) => view.id === chartMode)!
   const mainTotal = aggregates.main_net ?? 0
@@ -2137,9 +2160,9 @@ export default function SectorFlowPage() {
   const rankedSectors = [...visibleLatest].sort((a, b) => b.main_net - a.main_net)
   const featuredWatchlist = watchlistStatus === 'ready' && watchlist.length > 0
   const featuredStocks = featuredWatchlist ? watchlist : recentStocks
-  const viewNotice = chartMode === 'watchlist' ? watchlistError : chartMode === 'stock' ? stockError || watchlistError : (
+  const viewNotice = chartMode === 'stock-radar' ? null : chartMode === 'watchlist' ? watchlistError : chartMode === 'stock' ? stockError || watchlistError : (
     loadError || activeViewError || history.status.universe_warning || history.status.last_error || history.status.backfill_error
-    || (isDelayed ? '数据源更新时间超过30秒，当前显示最近可用数据。' : null)
+    || (isDelayed ? '数据源更新延迟，当前显示最近可用数据；请查看源时间。' : null)
   )
 
   return (
@@ -2155,14 +2178,14 @@ export default function SectorFlowPage() {
           {WORKSPACE_VIEWS.map(({ id, label, icon: Icon }) => (
             <button type="button" key={id} onClick={() => navigateView(id)} aria-current={chartMode === id ? 'page' : undefined} className={`nav-item ${chartMode === id ? 'is-active' : ''}`}>
               <Icon size={18} strokeWidth={1.7} /><span>{label}</span>
-              {id === 'radar' && <span className="nav-tag">{history.status.market_status === 'open' ? 'LIVE' : '15s'}</span>}
+              {id === 'radar' && <span className="nav-tag">{sectorMarketStatus === 'open' ? 'LIVE' : sectorMarketStatus === 'stale' || sectorMarketStatus === 'error' ? '延迟' : '15s'}</span>}
               {chartMode === id && <span className="nav-active-dot" />}
             </button>
           ))}
         </nav>
         <div className="sidebar-market-note">
           <span className="eyebrow">MARKET FLOW</span>
-          <div><span className={`status-dot ${history.status.market_status === 'open' ? 'is-live' : ''}`} />{statusLabel(history.status.market_status)}</div>
+          <div><span className={`status-dot ${sectorMarketStatus === 'open' ? 'is-live' : ''}`} />{statusLabel(sectorMarketStatus)}</div>
           <p>{history.status.market_status === 'closed' ? '收盘后保留当日资金轨迹，等待下一交易日。' : '跟随资金流向，观察市场每一次变化。'}</p>
         </div>
         <div className="sidebar-footer">
@@ -2187,7 +2210,7 @@ export default function SectorFlowPage() {
         <div className="workspace-content">
           <div className="page-heading">
             <div><p className="eyebrow">{activeView.english}</p><h1>{activeView.label}<span className="heading-dot">.</span></h1><p className="page-description">{activeView.description}</p></div>
-            <div className="session-summary"><span className={`session-pill ${history.status.market_status === 'open' ? 'is-live' : ''}`}><span className="status-dot" />{statusLabel(history.status.market_status)}</span><span><Clock3 size={13} />{history.trade_date || '--'} · {formatTime(history.status.last_source_time)}</span></div>
+            {chartMode === 'stock-radar' ? <div className="session-summary"><span className="session-pill">全市场扫描</span><span><Clock3 size={13} />个股源时间见下方</span></div> : <div className="session-summary"><span className={`session-pill ${sectorMarketStatus === 'open' ? 'is-live' : ''}`}><span className="status-dot" />{statusLabel(sectorMarketStatus)}</span><span><Clock3 size={13} />{history.trade_date || '--'} · {formatTime(history.status.last_source_time)}</span></div>}
           </div>
 
           {viewNotice && <div className="workspace-notice" role="status"><CircleAlert size={15} /><span>{viewNotice}</span><span className="notice-tag">数据状态</span></div>}
@@ -2217,7 +2240,9 @@ export default function SectorFlowPage() {
             <div className="workspace-panel-header">
               <div className="panel-title"><span className="panel-title-icon"><activeView.icon size={17} /></span><div><span className="eyebrow">{chartMode === 'main' ? 'INTRADAY CAPITAL FLOW' : activeView.english}</span><h2>{chartMode === 'main' ? '主力资金累计' : activeView.label}</h2></div></div>
               <div className="min-w-0 text-right">
-                {chartMode === 'signals' ? (
+                {chartMode === 'stock-radar' ? (
+                  <span className="watchlist-panel-count">沪深京 A 股 · 最近一轮主力资金变化</span>
+                ) : chartMode === 'signals' ? (
                   <span className="watchlist-panel-count">全行业扫描 · 自选股跟踪 · 历史回放</span>
                 ) : chartMode === 'watchlist' ? (
                   <span className="watchlist-panel-count">{watchlistStatus === 'ready' ? `已保存 ${watchlist.length} / 100 只` : '按账号保存'}</span>
@@ -2244,7 +2269,7 @@ export default function SectorFlowPage() {
                       <Clock3 className="size-3" />
                       {chartMode === 'detail'
                         ? formatTime(history.status.last_source_time)
-                        : `${formatTime(stockLastTime)} · ${statusLabel(stockMarketStatus)}`}
+                        : `${formatTime(stockLastTime)} · ${statusLabel(stockDisplayStatus)}`}
                     </span>
                   </div>
                 )}
@@ -2336,6 +2361,8 @@ export default function SectorFlowPage() {
                 )}
               </div>
             )}
+
+            <StockRadar active={chartMode === 'stock-radar'} onOpenStock={(stock) => { chooseStock(stock); navigateView('stock') }} />
 
             {chartMode === 'main' && <div className="chart-scroll-hint">左右滑动，查看完整资金曲线 <ArrowUpRight size={12} /></div>}
             <div className={chartMode === 'main' ? 'main-chart-layout flex min-h-[480px] flex-col xl:flex-row' : 'hidden'}>
@@ -2589,7 +2616,7 @@ export default function SectorFlowPage() {
 
             <SignalCenter
               active={chartMode === 'signals'}
-              marketStatus={history.status.market_status}
+              marketStatus={sectorMarketStatus}
               lastSectorSource={history.status.last_source_time}
               canOpenSector={(code) => history.selection.some((sector) => sector.sector_code === code)}
               onOpenSector={(code) => {
@@ -2777,7 +2804,7 @@ export default function SectorFlowPage() {
                   )}
                   {selectedStock && (
                     <div className="absolute right-3 top-3 z-10 rounded-md bg-white/90 px-2 py-1 text-xs text-slate-500 shadow-sm dark:bg-slate-900/90">
-                      {statusLabel(stockMarketStatus)} · {formatTime(stockLastTime)}
+                      {statusLabel(stockDisplayStatus)} · {formatTime(stockLastTime)}
                     </div>
                   )}
                 </div>

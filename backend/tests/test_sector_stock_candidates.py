@@ -54,7 +54,7 @@ class SectorStockCandidateTests(unittest.IsolatedAsyncioTestCase):
         with patch("services.sector_stock_candidates.safe_fetch", new=AsyncMock(return_value=payload)):
             await fetch_sector_stock_candidates("BK1033")
         created, data = candidate_service._candidate_cache[("BK1033", 5)]
-        candidate_service._candidate_cache[("BK1033", 5)] = (created - 61, data)
+        candidate_service._candidate_cache[("BK1033", 5)] = (created - 11, data)
         with patch("services.sector_stock_candidates.safe_fetch", new=AsyncMock(return_value=None)):
             result = await fetch_sector_stock_candidates("BK1033")
         self.assertTrue(result["stale"])

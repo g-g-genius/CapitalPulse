@@ -16,8 +16,8 @@ STOCK_FIELDS = "f2,f3,f6,f8,f10,f12,f13,f14,f62,f124"
 MIN_AMOUNT = 100_000_000
 MIN_TURNOVER_RATE = 1.0
 MAX_CHANGE_PERCENT = 8.0
-FRESH_CACHE_SECONDS = 60
-STALE_CACHE_SECONDS = 600
+FRESH_CACHE_SECONDS = 10
+STALE_CACHE_SECONDS = 120
 _candidate_cache: dict[tuple[str, int], tuple[float, dict[str, Any]]] = {}
 
 

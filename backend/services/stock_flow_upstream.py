@@ -15,10 +15,10 @@ from config import (
     EASTMONEY_STOCK_FLOW_SNAPSHOT_FALLBACK_URL,
     EASTMONEY_STOCK_FLOW_SNAPSHOT_URL,
     EASTMONEY_STOCK_SEARCH_URL,
+    LIVE_REQUEST_TIMEOUT_SECONDS,
 )
 from services.sector_flow_upstream import parse_minute_flows
 from utils.http_client import safe_fetch
-from utils.sector_selection import as_float
 
 logger = logging.getLogger(__name__)
 
@@ -152,12 +152,16 @@ async def fetch_stock_flow_snapshots(quote_ids: list[str]) -> list[dict[str, Any
         EASTMONEY_STOCK_FLOW_SNAPSHOT_URL,
         params=params,
         headers={"Referer": "https://data.eastmoney.com/"},
+        timeout=LIVE_REQUEST_TIMEOUT_SECONDS,
+        max_retries=2,
     )
     if not text:
         text = await safe_fetch(
             EASTMONEY_STOCK_FLOW_SNAPSHOT_FALLBACK_URL,
             params=params,
             headers={"Referer": "https://data.eastmoney.com/"},
+            timeout=LIVE_REQUEST_TIMEOUT_SECONDS,
+            max_retries=1,
         )
     if not text:
         return None
@@ -185,6 +189,12 @@ async def fetch_stock_flow_snapshots(quote_ids: list[str]) -> list[dict[str, Any
             source_time = int(data.get("f124") or 0)
         except (TypeError, ValueError):
             source_time = 0
+        flow_values = {
+            field: _finite_number(data.get(field))
+            for field in ("f62", "f66", "f72", "f78", "f84")
+        }
+        if source_time <= 0 or any(value is None for value in flow_values.values()):
+            continue
         results.append({
             "quote_id": quote_id,
             "code": code,
@@ -192,11 +202,11 @@ async def fetch_stock_flow_snapshots(quote_ids: list[str]) -> list[dict[str, Any
             "source_time": source_time,
             "price": _finite_number(data.get("f2")),
             "change_percent": _finite_number(data.get("f3")),
-            "main_net": as_float(data.get("f62")),
-            "super_large_net": as_float(data.get("f66")),
-            "large_net": as_float(data.get("f72")),
-            "mid_net": as_float(data.get("f78")),
-            "small_net": as_float(data.get("f84")),
+            "main_net": flow_values["f62"],
+            "super_large_net": flow_values["f66"],
+            "large_net": flow_values["f72"],
+            "mid_net": flow_values["f78"],
+            "small_net": flow_values["f84"],
         })
     return results
 
