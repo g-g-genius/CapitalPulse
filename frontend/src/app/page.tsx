@@ -16,6 +16,7 @@ import {
   ArrowDownLeft,
   ArrowUpRight,
   BarChart3,
+  BellRing,
   Bookmark,
   ChevronLeft,
   ChevronRight,
@@ -27,8 +28,11 @@ import {
   Radio,
   Radar,
   Search,
+  Star,
   Sun,
 } from 'lucide-react'
+import AuthEntry from './components/AuthEntry'
+import SignalCenter from './components/SignalCenter'
 
 type Flow = {
   sector_code: string
@@ -104,6 +108,46 @@ type StockSearchResult = {
   name: string
   market_name: string
   pinyin: string
+}
+
+type WatchlistStock = StockSearchResult & { created_at: number }
+type WatchlistStatus = 'loading' | 'guest' | 'ready' | 'error'
+type WatchlistQuote = {
+  quote_id: string
+  trade_date: string
+  source_time: number
+  price: number
+  change_percent: number
+  main_net: number
+  price_points: [number, number][]
+}
+
+function PriceSparkline({ quote }: { quote?: WatchlistQuote }) {
+  const points = quote?.price_points ?? []
+  if (!points.length) return <span className="watchlist-spark-empty">暂无走势</span>
+  const prices = points.map((point) => point[1])
+  const low = Math.min(...prices)
+  const high = Math.max(...prices)
+  const padding = Math.max((high - low) * 0.15, low * 0.001, 0.001)
+  const range = high - low + padding * 2
+  const path = points.map(([, price], index) => {
+    const x = points.length === 1 ? 78 : 4 + index * 148 / (points.length - 1)
+    const y = 38 - (price - low + padding) / range * 32
+    return `${index === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`
+  }).join(' ')
+  const tone = quote && quote.change_percent > 0 ? 'up' : quote && quote.change_percent < 0 ? 'down' : 'flat'
+  return <svg className={`watchlist-spark watchlist-spark-${tone}`} viewBox="0 0 156 44" role="img" aria-label={`${quote?.trade_date} 日内价格走势，${points.length} 个采样点`} preserveAspectRatio="none">
+    <path className="watchlist-spark-baseline" d="M4 22 H152" />
+    <path className="watchlist-spark-path" d={path} />
+    {points.length === 1 && <circle cx="78" cy={38 - padding / range * 32} r="2.5" />}
+  </svg>
+}
+
+function quoteTime(sourceTime: number): string {
+  return new Intl.DateTimeFormat('zh-CN', {
+    timeZone: 'Asia/Shanghai', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false,
+  }).format(new Date(sourceTime * 1000))
 }
 
 type SectorStockCandidate = StockSearchResult & {
@@ -208,7 +252,7 @@ function mergeDailyHistory(
   }
 }
 
-type ChartMode = 'main' | 'radar' | 'detail' | 'daily' | 'stock'
+type ChartMode = 'main' | 'radar' | 'signals' | 'detail' | 'daily' | 'stock' | 'watchlist'
 type Theme = 'light' | 'dark'
 const ThemeContext = createContext<Theme>('dark')
 const CHART_THEMES = {
@@ -219,9 +263,11 @@ const CHART_THEMES = {
 const WORKSPACE_VIEWS = [
   { id: 'main', label: '资金总览', description: '观察资金方向，跟踪板块轮动。', icon: LayoutDashboard, english: 'MARKET OVERVIEW' },
   { id: 'radar', label: '异动雷达', description: '从短时资金变化中，发现正在启动的板块。', icon: Radar, english: 'MOMENTUM RADAR' },
+  { id: 'signals', label: '异动提醒', description: '接收板块与自选股的短时资金信号，按交易日复盘。', icon: BellRing, english: 'SIGNAL CENTER' },
   { id: 'detail', label: '行业细分', description: '拆解不同订单规模的资金流向。', icon: Layers3, english: 'SECTOR ANALYSIS' },
   { id: 'daily', label: '30日资金', description: '拉长时间，看清板块资金的持续性。', icon: BarChart3, english: 'CAPITAL TRENDS' },
   { id: 'stock', label: '个股研究', description: '搜索股票，追踪日内资金与历史观察记录。', icon: Search, english: 'STOCK RESEARCH' },
+  { id: 'watchlist', label: '自选股', description: '把关注的股票存入账号，随时回到它们的资金走势。', icon: Star, english: 'MY WATCHLIST' },
 ] as const
 
 type RadarSector = {
@@ -1171,6 +1217,92 @@ export default function SectorFlowPage() {
   const [stockMarketStatus, setStockMarketStatus] = useState<ServiceStatus['market_status']>('closed')
   const [stockError, setStockError] = useState<string | null>(null)
   const [stockFlashing, setStockFlashing] = useState(false)
+  const [watchlist, setWatchlist] = useState<WatchlistStock[]>([])
+  const [watchlistStatus, setWatchlistStatus] = useState<WatchlistStatus>('loading')
+  const [watchlistError, setWatchlistError] = useState<string | null>(null)
+  const [watchlistBusy, setWatchlistBusy] = useState<string | null>(null)
+  const [watchlistQuotes, setWatchlistQuotes] = useState<Record<string, WatchlistQuote>>({})
+  const [watchlistQuoteError, setWatchlistQuoteError] = useState<string | null>(null)
+  const [watchlistQuoteLoading, setWatchlistQuoteLoading] = useState(false)
+
+  const loadWatchlist = useCallback(async (signal?: AbortSignal) => {
+    setWatchlistStatus('loading')
+    setWatchlistError(null)
+    try {
+      const response = await fetch('/api/finance/watchlist/stocks', {
+        cache: 'no-store', credentials: 'same-origin', signal,
+      })
+      if (signal?.aborted) return
+      if (response.status === 401) {
+        setWatchlist([])
+        setWatchlistQuotes({})
+        setWatchlistQuoteError(null)
+        setWatchlistStatus('guest')
+        return
+      }
+      const payload = await response.json()
+      if (!response.ok || !Array.isArray(payload.data)) {
+        throw new Error(payload.detail || payload.msg || '自选股加载失败')
+      }
+      setWatchlist(payload.data as WatchlistStock[])
+      setWatchlistStatus('ready')
+    } catch (error) {
+      if (signal?.aborted) return
+      setWatchlistStatus('error')
+      setWatchlistError(error instanceof Error ? error.message : '自选股加载失败')
+    }
+  }, [])
+
+  useEffect(() => {
+    const controller = new AbortController()
+    void loadWatchlist(controller.signal)
+    const signedOut = () => {
+      controller.abort()
+      setWatchlist([])
+      setWatchlistQuotes({})
+      setWatchlistQuoteError(null)
+      setWatchlistStatus('guest')
+      setWatchlistError(null)
+    }
+    window.addEventListener('capitalpulse:auth-changed', signedOut)
+    return () => {
+      controller.abort()
+      window.removeEventListener('capitalpulse:auth-changed', signedOut)
+    }
+  }, [loadWatchlist])
+
+  useEffect(() => {
+    if (chartMode !== 'watchlist' || watchlistStatus !== 'ready' || watchlist.length === 0) return
+    let active = true
+    const refresh = async () => {
+      setWatchlistQuoteLoading(true)
+      try {
+        const response = await fetch('/api/finance/watchlist/quotes', {
+          cache: 'no-store', credentials: 'same-origin',
+        })
+        if (response.status === 401) {
+          if (active) { setWatchlist([]); setWatchlistQuotes({}); setWatchlistQuoteError(null); setWatchlistStatus('guest') }
+          return
+        }
+        const payload = await response.json()
+        if (!response.ok || !Array.isArray(payload.data?.quotes)) {
+          throw new Error(payload.detail || payload.msg || '自选股行情加载失败')
+        }
+        if (!active) return
+        setWatchlistQuotes(Object.fromEntries(
+          (payload.data.quotes as WatchlistQuote[]).map((quote) => [quote.quote_id, quote]),
+        ))
+        setWatchlistQuoteError(payload.data.poll_error || null)
+      } catch (error) {
+        if (active) setWatchlistQuoteError(error instanceof Error ? error.message : '自选股行情加载失败')
+      } finally {
+        if (active) setWatchlistQuoteLoading(false)
+      }
+    }
+    void refresh()
+    const interval = window.setInterval(() => void refresh(), 10_000)
+    return () => { active = false; window.clearInterval(interval) }
+  }, [chartMode, watchlistStatus, watchlist.length])
 
   useEffect(() => {
     try {
@@ -1435,7 +1567,7 @@ export default function SectorFlowPage() {
   }, [chartMode, dailyPage, dailyPages])
 
   useEffect(() => {
-    if (chartMode !== 'stock') return
+    if (chartMode !== 'stock' && chartMode !== 'watchlist') return
     const keyword = stockQuery.trim()
     if (!keyword) {
       setStockSearchResults([])
@@ -1932,6 +2064,52 @@ export default function SectorFlowPage() {
     setStockQuery('')
     setStockSearchResults([])
   }
+  const toggleWatchlist = async (stock: StockSearchResult) => {
+    if (watchlistStatus === 'guest') {
+      window.location.assign('/login')
+      return
+    }
+    if (watchlistStatus !== 'ready' || watchlistBusy) return
+    const saved = watchlist.some((item) => item.quote_id === stock.quote_id)
+    setWatchlistBusy(stock.quote_id)
+    setWatchlistError(null)
+    try {
+      const response = await fetch(
+        saved
+          ? `/api/finance/watchlist/stocks/${encodeURIComponent(stock.quote_id)}`
+          : '/api/finance/watchlist/stocks',
+        {
+          method: saved ? 'DELETE' : 'POST',
+          credentials: 'same-origin',
+          headers: saved ? undefined : { 'Content-Type': 'application/json' },
+          body: saved ? undefined : JSON.stringify({
+            quote_id: stock.quote_id, code: stock.code, name: stock.name,
+            market_name: stock.market_name, pinyin: stock.pinyin,
+          }),
+        },
+      )
+      if (response.status === 401) {
+        setWatchlist([])
+        setWatchlistQuotes({})
+        setWatchlistStatus('guest')
+        throw new Error('登录已过期，请重新登录。')
+      }
+      const payload = await response.json()
+      if (!response.ok) throw new Error(payload.detail || payload.msg || '保存自选股失败')
+      if (saved) {
+        setWatchlist((items) => items.filter((item) => item.quote_id !== stock.quote_id))
+      } else {
+        const added = payload.data as WatchlistStock
+        setWatchlist((items) => [added, ...items.filter((item) => item.quote_id !== added.quote_id)])
+        setStockQuery('')
+        setStockSearchResults([])
+      }
+    } catch (error) {
+      setWatchlistError(error instanceof Error ? error.message : '保存自选股失败')
+    } finally {
+      setWatchlistBusy(null)
+    }
+  }
   const reloadDailyPage = () => {
     setDailyError(null)
     setDailyPages((pages) => {
@@ -1957,7 +2135,9 @@ export default function SectorFlowPage() {
   const flowScale = Math.max(1, ...FLOW_METRICS.map(([key]) => Math.abs(aggregates[key] ?? 0)))
   const leaderPoints = history.series.find((series) => series.sector_code === leader?.sector_code)?.points ?? []
   const rankedSectors = [...visibleLatest].sort((a, b) => b.main_net - a.main_net)
-  const viewNotice = chartMode === 'stock' ? stockError : (
+  const featuredWatchlist = watchlistStatus === 'ready' && watchlist.length > 0
+  const featuredStocks = featuredWatchlist ? watchlist : recentStocks
+  const viewNotice = chartMode === 'watchlist' ? watchlistError : chartMode === 'stock' ? stockError || watchlistError : (
     loadError || activeViewError || history.status.universe_warning || history.status.last_error || history.status.backfill_error
     || (isDelayed ? '数据源更新时间超过30秒，当前显示最近可用数据。' : null)
   )
@@ -2000,6 +2180,7 @@ export default function SectorFlowPage() {
           <div className="topbar-actions">
             <button type="button" className="workspace-search" onClick={() => { navigateView('stock'); setTimeout(() => document.querySelector<HTMLInputElement>('[aria-label="搜索股票名称或代码"]')?.focus(), 80) }}><Search size={16} /><span>搜索股票名称或代码</span></button>
             <span className="market-chip"><span className="status-dot" />A 股市场</span>
+            <AuthEntry />
           </div>
         </header>
 
@@ -2036,7 +2217,11 @@ export default function SectorFlowPage() {
             <div className="workspace-panel-header">
               <div className="panel-title"><span className="panel-title-icon"><activeView.icon size={17} /></span><div><span className="eyebrow">{chartMode === 'main' ? 'INTRADAY CAPITAL FLOW' : activeView.english}</span><h2>{chartMode === 'main' ? '主力资金累计' : activeView.label}</h2></div></div>
               <div className="min-w-0 text-right">
-                {chartMode === 'main' || chartMode === 'daily' || chartMode === 'radar' ? (
+                {chartMode === 'signals' ? (
+                  <span className="watchlist-panel-count">全行业扫描 · 自选股跟踪 · 历史回放</span>
+                ) : chartMode === 'watchlist' ? (
+                  <span className="watchlist-panel-count">{watchlistStatus === 'ready' ? `已保存 ${watchlist.length} / 100 只` : '按账号保存'}</span>
+                ) : chartMode === 'main' || chartMode === 'daily' || chartMode === 'radar' ? (
                   <div className="mt-1 flex flex-wrap items-center justify-end gap-3 text-xs text-slate-500">
                     <span className="flex items-center gap-1"><span className="size-2 rounded-full bg-red-600" />净流入</span>
                     <span className="flex items-center gap-1"><span className="size-2 rounded-full bg-emerald-600" />净流出</span>
@@ -2402,6 +2587,102 @@ export default function SectorFlowPage() {
               </div>
             )}
 
+            <SignalCenter
+              active={chartMode === 'signals'}
+              marketStatus={history.status.market_status}
+              lastSectorSource={history.status.last_source_time}
+              canOpenSector={(code) => history.selection.some((sector) => sector.sector_code === code)}
+              onOpenSector={(code) => {
+                pinnedCodeRef.current = code
+                setPinnedCode(code)
+                navigateView('main')
+                highlightSector(code)
+              }}
+              onOpenStock={(event) => {
+                const stock = watchlist.find((item) => item.quote_id === event.entity_code) ?? {
+                  quote_id: event.entity_code,
+                  code: event.entity_code.split('.')[1] ?? '',
+                  name: event.entity_name,
+                  market_name: 'A股',
+                  pinyin: '',
+                }
+                chooseStock(stock)
+                navigateView('stock')
+              }}
+            />
+
+            {chartMode === 'watchlist' && (
+              <div className="watchlist-page">
+                {watchlistStatus === 'ready' && (
+                  <div className="watchlist-page-toolbar">
+                    <div>
+                      <h3>关注列表</h3>
+                      <p>添加后保存在当前账号，点击股票可查看日内资金曲线。</p>
+                    </div>
+                    <div className="stock-search watchlist-page-search">
+                      <Search className="stock-search-icon" size={16} />
+                      <input
+                        type="search"
+                        value={stockQuery}
+                        onChange={(event) => setStockQuery(event.target.value)}
+                        placeholder="搜索名称或代码，加入自选"
+                        aria-label="搜索股票加入自选股"
+                      />
+                      {stockQuery.trim() && (
+                        <div className="watchlist-search-results">
+                          {stockSearching && <p>正在搜索股票…</p>}
+                          {!stockSearching && stockSearchError && <p>{stockSearchError}</p>}
+                          {!stockSearching && !stockSearchError && stockSearchResults.length === 0 && <p>未找到匹配的 A 股股票</p>}
+                          {!stockSearching && stockSearchResults.map((stock) => {
+                            const saved = watchlist.some((item) => item.quote_id === stock.quote_id)
+                            return (
+                              <button key={stock.quote_id} type="button" onClick={() => void toggleWatchlist(stock)} disabled={saved || !!watchlistBusy}>
+                                <span><strong>{stock.name}</strong><small>{stock.code} · {stock.market_name}</small></span>
+                                <span className="watchlist-search-action">{saved ? '已加入' : '＋ 加入'}</span>
+                              </button>
+                            )
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )}
+                {watchlistStatus === 'loading' && <div className="watchlist-page-state"><Radio className="animate-pulse" size={24} /><h3>正在读取自选股</h3></div>}
+                {watchlistStatus === 'guest' && <div className="watchlist-page-state"><Star size={30} /><h3>登录后建立你的自选股</h3><p>自选列表按账号保存，换个浏览器也能继续查看。</p><a href="/login">前往登录 <ArrowUpRight size={14} /></a></div>}
+                {watchlistStatus === 'error' && <div className="watchlist-page-state"><CircleAlert size={28} /><h3>暂时无法读取自选股</h3><p>{watchlistError}</p><button type="button" onClick={() => void loadWatchlist()}>重试</button></div>}
+                {watchlistStatus === 'ready' && watchlist.length === 0 && <div className="watchlist-page-state"><Star size={30} /><h3>还没有自选股</h3><p>在上方搜索并添加股票，或从个股研究页点击“加入自选”。</p></div>}
+                {watchlistStatus === 'ready' && watchlist.length > 0 && (
+                  <div className="watchlist-page-list" aria-label="我的自选股">
+                    <div className="watchlist-quote-status" role="status">
+                      <span>{watchlistQuoteLoading && Object.keys(watchlistQuotes).length === 0 ? '正在获取行情…' : '每 10 秒检查行情 · 走势为实际采集的日内价格'}</span>
+                      {watchlistQuoteError && <span className="watchlist-quote-warning">{watchlistQuoteError}；请以各股票标注的行情时间为准</span>}
+                    </div>
+                    <div className="watchlist-table-head" aria-hidden="true">
+                      <span>股票</span><span>日内走势</span><span>最新价</span><span>涨跌幅</span><span>主力净流入</span><span />
+                    </div>
+                    {watchlist.map((stock) => {
+                      const quote = watchlistQuotes[stock.quote_id]
+                      const tone = !quote ? 'flat' : quote.change_percent > 0 ? 'up' : quote.change_percent < 0 ? 'down' : 'flat'
+                      return <div className="watchlist-page-row" key={stock.quote_id}>
+                        <button type="button" className="watchlist-row-open" onClick={() => { chooseStock(stock); navigateView('stock') }}>
+                          <span className="stock-avatar">{stock.name.slice(0, 1)}</span>
+                          <span className="watchlist-row-identity"><strong>{stock.name}</strong><span className="mono">{stock.code} · {stock.market_name}</span></span>
+                        </button>
+                        <PriceSparkline quote={quote} />
+                        <span className={`watchlist-row-price watchlist-tone-${tone} mono`}>{quote ? quote.price.toFixed(2) : '—'}</span>
+                        <span className="watchlist-row-change-cell">
+                          <strong className={`watchlist-change-badge watchlist-change-${tone} mono`}>{quote ? `${quote.change_percent > 0 ? '+' : ''}${quote.change_percent.toFixed(2)}%` : '—'}</strong>
+                          <small>{quote ? `${quoteTime(quote.source_time)} 行情` : '等待行情'}</small>
+                        </span>
+                        <span className={`watchlist-row-flow ${quote && quote.main_net >= 0 ? 'flow-positive' : 'flow-negative'} mono`}>{quote ? formatYi(quote.main_net) : '—'}</span>
+                        <button type="button" className="watchlist-row-remove" onClick={() => void toggleWatchlist(stock)} disabled={!!watchlistBusy} aria-label={`移除${stock.name}`} title="移除自选"><Star size={17} fill="currentColor" /></button>
+                      </div>
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+
             {chartMode === 'stock' && (
               <div className="flex h-[480px] min-h-[420px] flex-col bg-slate-50 sm:h-[560px] lg:h-[640px] dark:bg-slate-950/40">
                 <div className="stock-toolbar flex flex-wrap items-center gap-3 border-b border-slate-200 px-4 py-3 dark:border-slate-800">
@@ -2474,7 +2755,7 @@ export default function SectorFlowPage() {
                   </div>
                 </div>
 
-                {selectedStock && <div className="stock-context-bar"><div className="stock-identity"><span className="stock-avatar">{selectedStock.name.slice(0, 1)}</span><div><h3>{selectedStock.name}</h3><span className="mono">{selectedStock.code} · {selectedStock.market_name}</span></div></div><div className="stock-main-value"><span>主力净流入</span><strong className={(stockHistory?.points.at(-1)?.[1] ?? 0) >= 0 ? 'flow-positive mono' : 'flow-negative mono'}>{stockHistory?.points.length ? formatYi(stockHistory.points.at(-1)![1]) : '--'}</strong></div></div>}
+                {selectedStock && <div className="stock-context-bar"><div className="stock-identity"><span className="stock-avatar">{selectedStock.name.slice(0, 1)}</span><div><h3>{selectedStock.name}</h3><span className="mono">{selectedStock.code} · {selectedStock.market_name}</span></div></div><div className="stock-context-actions"><button type="button" className="stock-watchlist-button" onClick={() => void toggleWatchlist(selectedStock)} disabled={watchlistStatus === 'loading' || watchlistStatus === 'error' || !!watchlistBusy} aria-pressed={watchlist.some((item) => item.quote_id === selectedStock.quote_id)}><Star size={15} fill={watchlist.some((item) => item.quote_id === selectedStock.quote_id) ? 'currentColor' : 'none'} />{watchlist.some((item) => item.quote_id === selectedStock.quote_id) ? '已加入自选' : '加入自选'}</button><div className="stock-main-value"><span>主力净流入</span><strong className={(stockHistory?.points.at(-1)?.[1] ?? 0) >= 0 ? 'flow-positive mono' : 'flow-negative mono'}>{stockHistory?.points.length ? formatYi(stockHistory.points.at(-1)![1]) : '--'}</strong></div></div></div>}
                 <div className="relative min-h-0 flex-1">
                   {selectedStock && stockHistory && stockHistory.points.length > 0 && (
                     <StockFlowChart data={stockHistory} flashing={stockFlashing} />
@@ -2508,9 +2789,9 @@ export default function SectorFlowPage() {
           {chartMode === 'main' && (
             <div className="research-grid">
               <section className="research-card">
-                <div className="research-card-header"><h2><Bookmark size={16} />最近观察</h2><button type="button" onClick={() => navigateView('stock')}>个股研究 <ArrowUpRight size={14} /></button></div>
-                <p className="research-caption">快速回到你关注的股票</p>
-                <div className="watchlist-grid">{recentStocks.length ? recentStocks.slice(0, 4).map((stock) => <button type="button" className="watchlist-item" key={stock.quote_id} onClick={() => { chooseStock(stock); navigateView('stock') }}><span className="stock-avatar">{stock.name.slice(0, 1)}</span><strong>{stock.name}</strong><span className="mono">{stock.code}</span><span className="watchlist-link">资金走势 <ArrowUpRight size={12} /></span></button>) : <button type="button" className="watchlist-empty" onClick={() => navigateView('stock')}><Search size={20} /><span>搜索一只股票，开始观察它的资金走势</span><ArrowUpRight size={16} /></button>}</div>
+                <div className="research-card-header"><h2>{featuredWatchlist ? <Star size={16} /> : <Bookmark size={16} />}{featuredWatchlist ? '我的自选' : '最近观察'}</h2><button type="button" onClick={() => navigateView('watchlist')}>管理自选 <ArrowUpRight size={14} /></button></div>
+                <p className="research-caption">{featuredWatchlist ? '账号保存的股票，随时打开资金走势' : '快速回到你最近查看的股票'}</p>
+                <div className="watchlist-grid">{featuredStocks.length ? featuredStocks.slice(0, 4).map((stock) => <button type="button" className="watchlist-item" key={stock.quote_id} onClick={() => { chooseStock(stock); navigateView('stock') }}><span className="stock-avatar">{stock.name.slice(0, 1)}</span><strong>{stock.name}</strong><span className="mono">{stock.code}</span><span className="watchlist-link">资金走势 <ArrowUpRight size={12} /></span></button>) : <button type="button" className="watchlist-empty" onClick={() => navigateView('watchlist')}><Star size={20} /><span>添加第一只自选股，开始跟踪资金走势</span><ArrowUpRight size={16} /></button>}</div>
               </section>
               <section className="research-card">
                 <div className="research-card-header"><h2><Layers3 size={16} />板块资金榜</h2><span className="subtle-tag">当日净流入</span></div>

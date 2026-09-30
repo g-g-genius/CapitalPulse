@@ -124,6 +124,9 @@ class SectorFlowParsingTests(unittest.TestCase):
 
 class SectorFlowDatabaseTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        sqlite_only = patch.dict("os.environ", {"DATABASE_URL": ""})
+        sqlite_only.start()
+        self.addCleanup(sqlite_only.stop)
         self.temp_dir = tempfile.TemporaryDirectory()
         self.service = SectorFlowRealtimeService()
         self.service.db_path = Path(self.temp_dir.name) / "sector-flow.sqlite3"

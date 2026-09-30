@@ -14,6 +14,7 @@ from typing import Any
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+from database import MysqlConnection, open_database, using_mysql
 from config import env_path
 from services.sector_flow_realtime import (
     CST,
@@ -40,7 +41,7 @@ class StockFlowRealtimeService:
         self.poll_seconds = max(1.0, float(os.getenv("STOCK_FLOW_POLL_SECONDS", "3")))
         self.retention_days = max(1, int(os.getenv("SECTOR_FLOW_RETENTION_DAYS", "30")))
         self.db_path = env_path("SECTOR_FLOW_DB_PATH", DEFAULT_DB_PATH)
-        self._connection: sqlite3.Connection | None = None
+        self._connection: sqlite3.Connection | MysqlConnection | None = None
         self.runtime_id = ""
         self._clients: dict[str, set[WebSocket]] = {}
         self._tasks: dict[str, asyncio.Task[None]] = {}
@@ -55,7 +56,7 @@ class StockFlowRealtimeService:
         return self._connection is not None
 
     @property
-    def connection(self) -> sqlite3.Connection:
+    def connection(self) -> sqlite3.Connection | MysqlConnection:
         if self._connection is None:
             raise RuntimeError("stock-flow database is not open")
         return self._connection
@@ -64,10 +65,10 @@ class StockFlowRealtimeService:
         if self.ready:
             return
         self.runtime_id = uuid.uuid4().hex
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(self.db_path, check_same_thread=False)
-        self.connection.execute("PRAGMA journal_mode=WAL")
-        self.connection.execute("PRAGMA busy_timeout=5000")
+        self._connection = open_database(self.db_path)
+        if using_mysql():
+            self.cleanup_old_data(datetime.now(CST).date())
+            return
         self.connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS stock_flow_snapshot (

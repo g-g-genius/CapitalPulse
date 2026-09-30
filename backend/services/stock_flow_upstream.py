@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import time
 from typing import Any
@@ -23,7 +24,15 @@ logger = logging.getLogger(__name__)
 
 SEARCH_TOKEN = "D43BF722C8E33BDC906FB84D85E326E8"
 QUOTE_ID_PATTERN = re.compile(r"^[01]\.\d{6}$")
-STOCK_FLOW_FIELDS = "f12,f14,f62,f66,f72,f78,f84,f124"
+STOCK_FLOW_FIELDS = "f2,f3,f12,f13,f14,f62,f66,f72,f78,f84,f124"
+
+
+def _finite_number(value: Any) -> float | None:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
 
 
 def parse_stock_search_items(items: list[Any]) -> list[dict[str, str]]:
@@ -123,12 +132,15 @@ async def fetch_stock_minute_data(
     }
 
 
-async def fetch_stock_flow_snapshot(quote_id: str) -> dict[str, Any] | None:
-    """Fetch the latest second-level cumulative fund-flow snapshot."""
-    if not QUOTE_ID_PATTERN.fullmatch(quote_id):
+async def fetch_stock_flow_snapshots(quote_ids: list[str]) -> list[dict[str, Any]] | None:
+    """Fetch one shared second-level snapshot for a batch of A-share symbols."""
+    unique_ids = list(dict.fromkeys(quote_ids))
+    if not unique_ids or len(unique_ids) > 50 or any(
+        not QUOTE_ID_PATTERN.fullmatch(quote_id) for quote_id in unique_ids
+    ):
         return None
     params = {
-        "secids": quote_id,
+        "secids": ",".join(unique_ids),
         "fields": STOCK_FLOW_FIELDS,
         "np": "1",
         "fltt": "2",
@@ -154,20 +166,42 @@ async def fetch_stock_flow_snapshot(quote_id: str) -> dict[str, Any] | None:
     except json.JSONDecodeError:
         return None
     diff = (payload.get("data") or {}).get("diff") or []
-    data = diff[0] if diff and isinstance(diff[0], dict) else {}
-    try:
-        source_time = int(data.get("f124") or 0)
-    except (TypeError, ValueError):
-        source_time = 0
-    code = str(data.get("f12") or quote_id.split(".", 1)[1])
-    return {
-        "quote_id": quote_id,
-        "code": code,
-        "name": str(data.get("f14") or ""),
-        "source_time": source_time,
-        "main_net": as_float(data.get("f62")),
-        "super_large_net": as_float(data.get("f66")),
-        "large_net": as_float(data.get("f72")),
-        "mid_net": as_float(data.get("f78")),
-        "small_net": as_float(data.get("f84")),
-    }
+    requested = set(unique_ids)
+    by_code: dict[str, list[str]] = {}
+    for quote_id in unique_ids:
+        by_code.setdefault(quote_id.split(".", 1)[1], []).append(quote_id)
+    results: list[dict[str, Any]] = []
+    for data in diff:
+        if not isinstance(data, dict):
+            continue
+        code = str(data.get("f12") or "")
+        market = str(data.get("f13") or "")
+        quote_id = f"{market}.{code}" if f"{market}.{code}" in requested else ""
+        if not quote_id and len(by_code.get(code, [])) == 1:
+            quote_id = by_code[code][0]
+        if not quote_id:
+            continue
+        try:
+            source_time = int(data.get("f124") or 0)
+        except (TypeError, ValueError):
+            source_time = 0
+        results.append({
+            "quote_id": quote_id,
+            "code": code,
+            "name": str(data.get("f14") or ""),
+            "source_time": source_time,
+            "price": _finite_number(data.get("f2")),
+            "change_percent": _finite_number(data.get("f3")),
+            "main_net": as_float(data.get("f62")),
+            "super_large_net": as_float(data.get("f66")),
+            "large_net": as_float(data.get("f72")),
+            "mid_net": as_float(data.get("f78")),
+            "small_net": as_float(data.get("f84")),
+        })
+    return results
+
+
+async def fetch_stock_flow_snapshot(quote_id: str) -> dict[str, Any] | None:
+    """Fetch the latest second-level cumulative fund-flow snapshot."""
+    results = await fetch_stock_flow_snapshots([quote_id])
+    return results[0] if results else None

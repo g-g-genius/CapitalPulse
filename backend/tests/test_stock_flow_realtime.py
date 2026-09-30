@@ -24,6 +24,9 @@ def make_stock_flow(source_time: int) -> dict:
 
 class StockFlowRealtimeTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        sqlite_only = patch.dict("os.environ", {"DATABASE_URL": ""})
+        sqlite_only.start()
+        self.addCleanup(sqlite_only.stop)
         self.temp_dir = tempfile.TemporaryDirectory()
         self.service = StockFlowRealtimeService()
         self.service.db_path = Path(self.temp_dir.name) / "stock-flow.sqlite3"

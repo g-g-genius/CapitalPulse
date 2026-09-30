@@ -1,6 +1,7 @@
 """FastAPI application entry point."""
 
 import logging
+import os
 import sys
 from contextlib import asynccontextmanager
 
@@ -9,8 +10,10 @@ from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 
 from config import HOST, PORT
-from routers import sector_flow_realtime, stock_flow_realtime
+from routers import auth, sector_flow_realtime, signals, stock_flow_realtime, watchlist
+from services.auth_service import auth_service
 from services.sector_flow_realtime import sector_flow_service
+from services.signal_service import signal_service
 from services.stock_flow_realtime import stock_flow_service
 from utils.http_client import close_client
 
@@ -27,10 +30,13 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Application lifespan: startup and shutdown."""
     logger.info("backend starting up...")
+    auth_service.ensure_schema()
     await sector_flow_service.start()
     await stock_flow_service.start()
+    await signal_service.start()
     yield
     logger.info("backend shutting down...")
+    await signal_service.stop()
     await stock_flow_service.stop()
     await sector_flow_service.stop()
     await close_client()
@@ -44,10 +50,16 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS middleware - allow all origins
+# The browser normally uses the same-origin Next.js API proxy.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        origin.strip()
+        for origin in os.getenv(
+            "CORS_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000"
+        ).split(",")
+        if origin.strip()
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -55,6 +67,9 @@ app.add_middleware(
 
 app.include_router(sector_flow_realtime.router, prefix="/api", tags=["Real-time Sector Flow"])
 app.include_router(stock_flow_realtime.router, prefix="/api", tags=["Real-time Stock Flow"])
+app.include_router(auth.router, prefix="/api", tags=["Account"])
+app.include_router(watchlist.router, prefix="/api", tags=["Watchlist"])
+app.include_router(signals.router, prefix="/api", tags=["Signals"])
 
 
 # Health check endpoint

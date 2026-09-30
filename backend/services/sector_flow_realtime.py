@@ -15,6 +15,7 @@ from typing import Any
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+from database import MysqlConnection, open_database, using_mysql
 from config import (
     EASTMONEY_SECTOR_FLOW_SNAPSHOT_FALLBACK_URL,
     EASTMONEY_SECTOR_FLOW_SNAPSHOT_URL,
@@ -130,7 +131,7 @@ class SectorFlowRealtimeService:
         self.poll_seconds = max(1.0, float(os.getenv("SECTOR_FLOW_POLL_SECONDS", "3")))
         self.retention_days = max(1, int(os.getenv("SECTOR_FLOW_RETENTION_DAYS", "30")))
         self.db_path = env_path("SECTOR_FLOW_DB_PATH", DEFAULT_DB_PATH)
-        self._connection: sqlite3.Connection | None = None
+        self._connection: sqlite3.Connection | MysqlConnection | None = None
         self._task: asyncio.Task[None] | None = None
         self._backfill_task: asyncio.Task[None] | None = None
         self._backfill_date: date | None = None
@@ -157,7 +158,7 @@ class SectorFlowRealtimeService:
         self._last_error: str | None = None
 
     @property
-    def connection(self) -> sqlite3.Connection:
+    def connection(self) -> sqlite3.Connection | MysqlConnection:
         if self._connection is None:
             raise RuntimeError("sector-flow database is not open")
         return self._connection
@@ -201,10 +202,9 @@ class SectorFlowRealtimeService:
             self._connection = None
 
     def _open_database(self) -> None:
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(self.db_path, check_same_thread=False)
-        self.connection.execute("PRAGMA journal_mode=WAL")
-        self.connection.execute("PRAGMA busy_timeout=5000")
+        self._connection = open_database(self.db_path)
+        if using_mysql():
+            return
         self.connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS sector_flow_selection (
@@ -436,23 +436,22 @@ class SectorFlowRealtimeService:
         return True
 
     def _cleanup_daily_cache(self) -> None:
-        self.connection.execute(
-            """
-            DELETE FROM sector_flow_daily
-            WHERE rowid IN (
-                SELECT rowid
-                FROM (
-                    SELECT rowid,
-                           ROW_NUMBER() OVER (
-                               PARTITION BY sector_code
-                               ORDER BY trade_date DESC
-                           ) AS row_number
-                    FROM sector_flow_daily
-                )
-                WHERE row_number > 30
+        rows = self.connection.execute(
+            "SELECT sector_code, trade_date FROM sector_flow_daily "
+            "ORDER BY sector_code, trade_date DESC"
+        ).fetchall()
+        seen: dict[str, int] = {}
+        expired: list[tuple[str, str]] = []
+        for code, trade_date in rows:
+            code = str(code)
+            seen[code] = seen.get(code, 0) + 1
+            if seen[code] > 30:
+                expired.append((code, str(trade_date)))
+        if expired:
+            self.connection.executemany(
+                "DELETE FROM sector_flow_daily WHERE sector_code = ? AND trade_date = ?",
+                expired,
             )
-            """
-        )
         self.connection.execute(
             """
             DELETE FROM sector_flow_daily
@@ -866,14 +865,14 @@ class SectorFlowRealtimeService:
             self._save_selection(current.date(), next_selection)
             self._selection = next_selection
 
-        # Keep full-resolution curves for visible sectors and one sample per minute
-        # for the rest, so a newly ranked sector still has a useful intraday curve.
+        # Keep full-resolution curves for visible sectors and a 15-second sample
+        # for the rest, so historical signal replay covers the full industry set.
         selected_codes = set(next_codes)
         rows_to_persist = [
             flow for flow in valid_flows
             if flow["sector_code"] in selected_codes
-            or self._latest.get(flow["sector_code"], {}).get("source_time", 0) // 60
-                < int(flow["source_time"]) // 60
+            or self._latest.get(flow["sector_code"], {}).get("source_time", 0) // 15
+                < int(flow["source_time"]) // 15
         ]
         self._persist_snapshot(current.date(), rows_to_persist, received_at)
         broadcast_flows = [
@@ -894,6 +893,13 @@ class SectorFlowRealtimeService:
             if source_age > SNAPSHOT_ALERT_SECONDS else None
         )
         self._status = "stale" if delayed else "open"
+
+        try:
+            from services.signal_service import signal_service
+
+            signal_service.ingest_sector(valid_flows, current)
+        except Exception:
+            logger.exception("[sector-flow] Signal evaluation failed")
 
         await self.broadcast({
             "type": "update",

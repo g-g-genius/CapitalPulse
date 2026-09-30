@@ -10,6 +10,7 @@ from services.sector_flow_upstream import (
 )
 from services.stock_flow_upstream import (
     fetch_stock_flow_snapshot,
+    fetch_stock_flow_snapshots,
     fetch_stock_minute_data,
     parse_stock_search_items,
     search_stocks,
@@ -159,6 +160,23 @@ class SectorFlowUpstreamTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["super_large_net"], 40.0)
         self.assertEqual(fetch.await_args.kwargs["params"]["secids"], "1.600519")
         self.assertIn("ulist.np/get", fetch.await_args.args[0])
+
+    async def test_batch_snapshot_keeps_only_requested_a_share_quote_ids(self):
+        payload = json.dumps({"data": {"diff": [
+            {"f12": "600519", "f13": 1, "f14": "贵州茅台", "f2": 1888.8,
+             "f3": 1.25, "f62": 20, "f124": 1785903000},
+            {"f12": "000001", "f13": 0, "f14": "平安银行", "f62": -10, "f124": 1785903000},
+            {"f12": "300001", "f13": 0, "f14": "其他", "f62": 2, "f124": 1785903000},
+        ]}})
+        fetch = AsyncMock(return_value=payload)
+        with patch("services.stock_flow_upstream.safe_fetch", fetch):
+            result = await fetch_stock_flow_snapshots(["1.600519", "0.000001"])
+        self.assertEqual({item["quote_id"] for item in result}, {"1.600519", "0.000001"})
+        self.assertEqual(result[0]["price"], 1888.8)
+        self.assertEqual(result[0]["change_percent"], 1.25)
+        self.assertIsNone(result[1]["price"])
+        self.assertEqual(fetch.await_args.kwargs["params"]["secids"], "1.600519,0.000001")
+        self.assertIn("f2,f3", fetch.await_args.kwargs["params"]["fields"])
 
     async def test_fetches_stock_minute_history_for_pre_subscription_backfill(self):
         payload = json.dumps({

@@ -3,6 +3,7 @@ import type { NextConfig } from "next";
 const nextConfig: NextConfig = {
   output: "standalone",
   devIndicators: false,
+  allowedDevOrigins: ["127.0.0.1"],
   reactStrictMode: true,
   // Proxy /api/finance/* requests to backend.
   // VANE_API_URL is a server-only variable (runtime-configurable in Docker).
