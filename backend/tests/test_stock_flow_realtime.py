@@ -199,6 +199,17 @@ class StockFlowRealtimeTests(unittest.IsolatedAsyncioTestCase):
         ).fetchall()
         self.assertEqual(dates, [("2026-06-27",)])
 
+    async def test_out_of_order_fresh_snapshot_cannot_rewind_stock_curve(self):
+        current = datetime(2026, 8, 5, 10, 0, tzinfo=CST)
+        stamp = int(current.timestamp())
+        with patch("services.stock_flow_realtime.fetch_stock_flow_snapshot", new=AsyncMock(
+            side_effect=[make_stock_flow(stamp), make_stock_flow(stamp - 1)]
+        )), patch.object(self.service, "_broadcast", new=AsyncMock()) as broadcast:
+            self.assertTrue(await self.service.collect_once("1.600519", current))
+            self.assertFalse(await self.service.collect_once("1.600519", current))
+        self.assertEqual(self.service._last_source_times["1.600519"], stamp)
+        broadcast.assert_awaited_once()
+
 
 if __name__ == "__main__":
     unittest.main()

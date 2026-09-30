@@ -2,6 +2,8 @@
 
 import asyncio
 import logging
+import time
+from urllib.parse import urlsplit
 from typing import Optional
 
 import httpx
@@ -12,6 +14,18 @@ logger = logging.getLogger(__name__)
 
 # Module-level async client (created lazily)
 _client: Optional[httpx.AsyncClient] = None
+_slots: asyncio.Semaphore | None = None
+_endpoints: dict[str, dict] = {}
+FAILURE_THRESHOLD = 3
+
+
+def transport_status() -> list[dict]:
+    """Only endpoint paths and counters; never expose query strings or headers."""
+    now = time.monotonic()
+    return [{"endpoint": key, "failures": state["failures"],
+             "retry_in_seconds": round(max(0, state["until"] - now), 1),
+             "last_status": state.get("status"), "skipped": state["skipped"]}
+            for key, state in _endpoints.items()]
 
 
 async def get_client() -> httpx.AsyncClient:
@@ -22,16 +36,19 @@ async def get_client() -> httpx.AsyncClient:
             timeout=httpx.Timeout(REQUEST_TIMEOUT),
             headers=DEFAULT_HEADERS,
             follow_redirects=True,
+            limits=httpx.Limits(max_connections=12, max_keepalive_connections=8),
         )
     return _client
 
 
 async def close_client() -> None:
     """Close the shared async HTTP client."""
-    global _client
+    global _client, _slots
     if _client is not None and not _client.is_closed:
         await _client.aclose()
         _client = None
+    _slots = None
+    _endpoints.clear()
 
 
 def _decode_bytes(data: bytes) -> str:
@@ -74,6 +91,34 @@ async def safe_fetch(
     Returns:
         Decoded text or None on failure.
     """
+    global _slots
+    parts = urlsplit(url)
+    key = f"{parts.scheme}://{parts.netloc}{parts.path}"
+    state = _endpoints.setdefault(key, {"failures": 0, "until": 0., "probe": False, "skipped": 0})
+    if time.monotonic() < state["until"] or state["probe"]:
+        state["skipped"] += 1
+        return None
+    probing = state["failures"] >= FAILURE_THRESHOLD
+    if probing:
+        state["probe"] = True
+    if _slots is None:
+        _slots = asyncio.Semaphore(8)
+    try:
+        result = await _fetch_text(url, params=params, headers=headers, force_gbk=force_gbk,
+                                   timeout=timeout, max_retries=max_retries, state=state)
+        if result is not None:
+            state.update(failures=0, until=0.)
+        elif state.get("status") not in (400, 401, 403, 404):
+            state["failures"] += 1
+            if state["failures"] >= FAILURE_THRESHOLD:
+                state["until"] = max(state["until"], time.monotonic() + min(30, 5 * 2 ** min(3, state["failures"] - FAILURE_THRESHOLD)))
+        return result
+    finally:
+        if probing:
+            state["probe"] = False
+
+
+async def _fetch_text(url, *, params, headers, force_gbk, timeout, max_retries, state):
     client = await get_client()
     attempts = MAX_RETRIES if max_retries is None else max(1, max_retries)
     merged_headers = {**DEFAULT_HEADERS}
@@ -82,13 +127,14 @@ async def safe_fetch(
 
     for attempt in range(1, attempts + 1):
         try:
-            if timeout is None:
-                resp = await client.get(url, params=params, headers=merged_headers)
-            else:
-                resp = await asyncio.wait_for(
-                    client.get(url, params=params, headers=merged_headers, timeout=timeout),
-                    timeout=timeout,
-                )
+            budget = timeout if timeout is not None else REQUEST_TIMEOUT
+            # Include queueing, DNS, connection and reading in the same deadline.
+            async with asyncio.timeout(budget):
+                async with _slots:
+                    if time.monotonic() < state["until"]:
+                        return None
+                    resp = await client.get(url, params=params, headers=merged_headers, timeout=budget)
+            state["status"] = resp.status_code
 
             if resp.status_code == 200:
                 if force_gbk:
@@ -113,8 +159,18 @@ async def safe_fetch(
                 "[http_client] HTTP %s for %s (attempt %d/%d)",
                 resp.status_code, url, attempt, attempts,
             )
+            if resp.status_code == 429:
+                try:
+                    delay = max(1, min(300, float(resp.headers.get("retry-after", "30"))))
+                except ValueError:
+                    delay = 30
+                state["until"] = time.monotonic() + delay
+                return None
+            if 400 <= resp.status_code < 500 and resp.status_code != 408:
+                return None
 
         except (httpx.HTTPError, asyncio.TimeoutError) as e:
+            state["status"] = type(e).__name__
             logger.warning(
                 "[http_client] Request error for %s (attempt %d/%d): %s: %s",
                 url, attempt, attempts, type(e).__name__, str(e),

@@ -158,7 +158,7 @@ class SignalService:
             "AND (entity_type = 'sector' OR EXISTS ("
             "SELECT 1 FROM watchlist_stocks AS w WHERE w.user_id = ? "
             "AND w.quote_id = e.entity_code)) "
-            "ORDER BY id DESC LIMIT ?",
+            f"ORDER BY id {'ASC' if since_id else 'DESC'} LIMIT ?",
             (trade_date.isoformat(), since_id, user_id or 0, limit),
         ).fetchall()
         return [self._event(row) for row in rows]
@@ -249,15 +249,17 @@ class SignalService:
             current = datetime.now(CST)
             if market_status_at(current) == "open":
                 try:
-                    await self._poll_watchlist_once(current)
+                    await self._poll_watchlist_once()
                 except asyncio.CancelledError:
                     raise
-                except Exception as exc:
-                    self.stock_poll_error = str(exc)
+                except Exception:
+                    with contextlib.suppress(Exception):
+                        self.connection.rollback()
+                    self.stock_poll_error = "自选股采集失败，稍后重试"
                     logger.exception("[signals] Watchlist stock poll failed")
             await asyncio.sleep(max(1, STOCK_POLL_SECONDS - (time.monotonic() - started)))
 
-    async def _poll_watchlist_once(self, current: datetime) -> None:
+    async def _poll_watchlist_once(self, current: datetime | None = None) -> None:
         rows = self.connection.execute(
             "SELECT quote_id, MAX(name) FROM watchlist_stocks "
             "GROUP BY quote_id ORDER BY quote_id"
@@ -276,11 +278,15 @@ class SignalService:
                 return await fetch_stock_flow_snapshots(chunk)
 
         results = await asyncio.gather(*(fetch(chunk) for chunk in chunks))
-        self.stock_poll_error = "部分自选股快照请求失败" if any(batch is None for batch in results) else None
+        current = current or datetime.now(CST)
+        valid_codes = {str(flow["quote_id"]) for batch in results if batch for flow in batch
+                       if -MAX_FUTURE_SKEW_SECONDS <= current.timestamp() - int(flow["source_time"]) <= MAX_SOURCE_AGE_SECONDS}
+        self.stock_poll_error = "部分自选股快照缺失或过期" if set(quote_ids) - valid_codes else None
         from services.stock_flow_realtime import stock_flow_service
 
         received_at = datetime.now(CST).isoformat(timespec="milliseconds")
         fresh: list[dict[str, Any]] = []
+        seen: set[str] = set()
         for batch in results:
             if batch is None:
                 continue
@@ -288,12 +294,13 @@ class SignalService:
                 source_time = int(flow["source_time"])
                 quote_id = str(flow["quote_id"])
                 if (
-                    datetime.fromtimestamp(source_time, CST).date() != current.date()
+                    quote_id not in names or quote_id in seen
+                    or datetime.fromtimestamp(source_time, CST).date() != current.date()
                     or not -MAX_FUTURE_SKEW_SECONDS <= current.timestamp() - source_time <= MAX_SOURCE_AGE_SECONDS
                     or source_time <= self._last_stock_source.get(quote_id, 0)
                 ):
                     continue
-                self._last_stock_source[quote_id] = source_time
+                seen.add(quote_id)
                 if not flow["name"]:
                     flow["name"] = names.get(quote_id, "")
                 flow["received_at"] = received_at
@@ -314,6 +321,8 @@ class SignalService:
                     stock_flow_service._persist_snapshot(current.date(), flow)
                 fresh.append(flow)
         self.connection.commit()
+        for flow in fresh:
+            self._last_stock_source[str(flow["quote_id"])] = int(flow["source_time"])
         self.ingest_stock(fresh, current)
 
 

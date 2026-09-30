@@ -130,10 +130,13 @@ export default function SignalCenter({
   useEffect(() => {
     let disposed = false
     let inFlight = false
+    let controller: AbortController | null = null
     let generation = 0
     const poll = async () => {
       if (inFlight) return
       inFlight = true
+      controller = new AbortController()
+      const deadline = window.setTimeout(() => controller?.abort(), 10000)
       const requestGeneration = generation
       const day = cstDate()
       if (currentDate.current !== day) {
@@ -144,7 +147,7 @@ export default function SignalCenter({
       }
       try {
         const response = await fetch(`/api/finance/signals/recent?trade_date=${day}&since_id=${cursor.current}&limit=200`, {
-          cache: 'no-store', credentials: 'same-origin',
+          cache: 'no-store', credentials: 'same-origin', signal: controller.signal,
         })
         const payload = await response.json()
         if (!response.ok || payload.code !== 200 || !Array.isArray(payload.data?.events)) {
@@ -166,7 +169,8 @@ export default function SignalCenter({
           })
           const matching = incoming.filter((event) =>
             matchesSensitivity(event, settingsRef.current.sensitivity)
-            && Date.now() / 1000 - event.source_time <= 30,
+            && Date.now() / 1000 - event.source_time <= 30
+            && Date.now() / 1000 - event.source_time >= -5,
           )
           if (matching.length) {
             const latest = matching.reduce((left, right) => left.source_time > right.source_time ? left : right)
@@ -192,6 +196,7 @@ export default function SignalCenter({
       } catch (error) {
         if (!disposed && requestGeneration === generation) setPollError(error instanceof Error ? error.message : '提醒列表读取失败')
       } finally {
+        window.clearTimeout(deadline)
         inFlight = false
       }
     }
@@ -200,6 +205,7 @@ export default function SignalCenter({
     const onVisibility = () => { if (document.visibilityState === 'visible') void poll() }
     const onAuthChange = () => {
       generation += 1
+      controller?.abort()
       cursor.current = 0
       initialized.current = false
       setEvents([])
@@ -210,6 +216,7 @@ export default function SignalCenter({
     window.addEventListener('capitalpulse:auth-changed', onAuthChange)
     return () => {
       disposed = true
+      controller?.abort()
       clearInterval(interval)
       document.removeEventListener('visibilitychange', onVisibility)
       window.removeEventListener('capitalpulse:auth-changed', onAuthChange)

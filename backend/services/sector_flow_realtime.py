@@ -29,6 +29,8 @@ from services.sector_flow_upstream import (
     fetch_sector_minute_data,
 )
 from utils.http_client import safe_fetch
+from utils.flow_windows import window_change
+from utils.trading_calendar import is_trading_day, calendar_status
 from utils.sector_selection import (
     as_float,
     filter_second_level_industries,
@@ -71,7 +73,8 @@ def _env_bool(name: str, default: bool) -> bool:
 
 def market_status_at(value: datetime) -> str:
     """Return the A-share session state for a CST-aware datetime."""
-    if value.weekday() >= 5:
+    value = value.astimezone(CST)
+    if not is_trading_day(value.date()):
         return "closed"
     current = value.timetz().replace(tzinfo=None)
     if current < MORNING_START:
@@ -573,7 +576,7 @@ class SectorFlowRealtimeService:
         monotonic_now: float,
     ) -> None:
         if (
-            now.weekday() >= 5
+            not is_trading_day(now.date())
             or now.timetz().replace(tzinfo=None) <= MORNING_START
             or self._selection_date != now.date()
             or not self._universe
@@ -768,37 +771,40 @@ class SectorFlowRealtimeService:
         for flow in flows:
             code = flow["sector_code"]
             samples = self._radar_samples.setdefault(code, deque())
-            if samples and source_time <= samples[-1][0]:
+            stamp = int(flow["source_time"])
+            if samples and stamp < samples[-1][0]:
                 continue
+            if samples and stamp - samples[-1][0] > 20:
+                samples.clear()
+                self._positive_turns.pop(code, None)
             previous = samples[-1] if samples else None
-            samples.append((source_time, flow["main_net"]))
-            if previous is not None and previous[1] <= 0 < flow["main_net"]:
-                self._positive_turns[code] = source_time
-            while samples and source_time - samples[0][0] > 240:
+            if previous is None or stamp > previous[0]:
+                samples.append((stamp, flow["main_net"]))
+                if previous is not None and previous[1] <= 0 < flow["main_net"]:
+                    self._positive_turns[code] = stamp
+            while samples and stamp - samples[0][0] > 240:
                 samples.popleft()
+            value = samples[-1][1]
 
             def change(seconds: int) -> float | None:
-                reference = next(
-                    (value for stamp, value in reversed(samples) if stamp <= source_time - seconds),
-                    None,
-                )
-                return round(flow["main_net"] - reference, 2) if reference is not None else None
+                delta = window_change(samples, stamp, value, seconds)
+                return round(delta, 2) if delta is not None else None
 
             sectors.append({
                 "sector_code": code,
                 "sector_name": flow["sector_name"],
-                "main_net": flow["main_net"],
+                "main_net": value,
                 "change_15s": change(15),
                 "change_1m": change(60),
                 "change_3m": change(180),
-                "turned_positive": flow["main_net"] > 0 and source_time - self._positive_turns.get(code, 0) <= 300,
+                "turned_positive": value > 0 and stamp - self._positive_turns.get(code, 0) <= 300,
                 "turn_time": self._positive_turns.get(code),
-                "source_time": source_time,
+                "source_time": stamp,
                 "points": list(samples),
             })
         self._radar = {
             "source_time": source_time,
-            "scanned_count": len(flows),
+            "scanned_count": len(sectors),
             "sectors": sectors,
         }
 
@@ -808,6 +814,7 @@ class SectorFlowRealtimeService:
         if not await self._ensure_selection(current.date()):
             return False
         flows = await self._fetch_snapshot()
+        current = now or datetime.now(CST)
         if not flows:
             source_age = (
                 current.timestamp() - self._last_source_time
@@ -822,7 +829,13 @@ class SectorFlowRealtimeService:
 
         universe = self._universe or self._selection
         universe_by_code = {sector["code"]: sector for sector in universe}
-        flows = [flow for flow in flows if flow["sector_code"] in universe_by_code]
+        # Deduplicate before coverage checks, keeping the newest source row.
+        by_code = {}
+        for flow in flows:
+            code = flow["sector_code"]
+            if code in universe_by_code and int(flow["source_time"]) > by_code.get(code, {}).get("source_time", 0):
+                by_code[code] = flow
+        flows = list(by_code.values())
         if not flows:
             await self._set_status("error", "板块资金快照为空")
             return False
@@ -831,14 +844,15 @@ class SectorFlowRealtimeService:
             flow
             for flow in flows
             if datetime.fromtimestamp(int(flow["source_time"]), CST).date() == current.date()
-            and int(flow["source_time"]) - current.timestamp() <= MAX_FUTURE_SKEW_SECONDS
+            and -MAX_FUTURE_SKEW_SECONDS <= current.timestamp() - int(flow["source_time"]) <= SNAPSHOT_DELAY_SECONDS
+            and int(flow["source_time"]) >= self._latest.get(flow["sector_code"], {}).get("source_time", 0)
         ]
         if not valid_flows:
-            await self._set_status("stale", "上游尚未提供当天板块资金快照")
+            await self._set_status("stale", "板块资金快照过期或时间倒退，等待有效数据")
             return False
 
         # A partial upstream response must not silently replace the ranking.
-        if self._universe and len(valid_flows) < max(1, int(len(self._universe) * 0.9)):
+        if self._universe and len(valid_flows) < max(1, math.ceil(len(self._universe) * 0.9)):
             await self._set_status("stale", "板块资金快照不完整，等待下一次刷新")
             return False
 
@@ -847,7 +861,7 @@ class SectorFlowRealtimeService:
             flow for flow in valid_flows
             if latest_source_time - int(flow["source_time"]) <= SNAPSHOT_DELAY_SECONDS
         ]
-        if self._universe and len(valid_flows) < max(1, int(len(self._universe) * 0.9)):
+        if self._universe and len(valid_flows) < max(1, math.ceil(len(self._universe) * 0.9)):
             await self._set_status("stale", "板块资金快照时间不一致，等待下一次刷新")
             return False
 
@@ -938,7 +952,7 @@ class SectorFlowRealtimeService:
         monotonic_now: float,
     ) -> None:
         if (
-            now.weekday() >= 5
+            not is_trading_day(now.date())
             or now.timetz().replace(tzinfo=None) <= AFTERNOON_END
             or self._selection_date != now.date()
             or self._daily_refresh_date == now.date()
@@ -971,19 +985,27 @@ class SectorFlowRealtimeService:
         while True:
             now = datetime.now(CST)
             session_status = market_status_at(now)
-            if now.weekday() < 5 and (
+            if is_trading_day(now.date()) and (
                 self._selection_date != now.date()
                 or (session_status != "closed" and not self._universe)
             ):
-                await self._ensure_selection(
-                    now.date(), allow_fetch=session_status != "closed"
-                )
+                try:
+                    await self._ensure_selection(
+                        now.date(), allow_fetch=session_status != "closed"
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("[sector-flow] Selection refresh failed; will retry")
+                    await self._set_status("error", "行业名单刷新失败，稍后重试")
+                    await asyncio.sleep(15)
+                    continue
             if session_status == "open":
                 self._schedule_minute_backfill(now, loop.time())
 
             if session_status == "open":
                 try:
-                    await self.collect_once(now)
+                    await self.collect_once()
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
@@ -1038,6 +1060,8 @@ class SectorFlowRealtimeService:
             "universe_warning": None if self._universe else "全行业列表暂不可用，当前显示历史板块名单，动态排名暂停",
             "last_error": self._last_error,
             "poll_seconds": self.poll_seconds,
+            "calendar": calendar_status(now.date()),
+            "collector_running": self._task is not None and not self._task.done(),
             "backfill_status": self._backfill_status,
             "backfill_inserted_points": self._backfill_inserted_points,
             "backfill_error": self._backfill_error,
@@ -1210,12 +1234,12 @@ class SectorFlowRealtimeService:
     @staticmethod
     def _expected_daily_trade_date(trade_date: date, now: datetime) -> date:
         expected = now.date()
-        if now.weekday() >= 5 or now.timetz().replace(tzinfo=None) < MORNING_START:
+        if not is_trading_day(now.date()) or now.timetz().replace(tzinfo=None) < MORNING_START:
             expected -= timedelta(days=1)
-        while expected.weekday() >= 5:
+        while not is_trading_day(expected):
             expected -= timedelta(days=1)
         expected = min(expected, trade_date)
-        while expected.weekday() >= 5:
+        while not is_trading_day(expected):
             expected -= timedelta(days=1)
         return expected
 

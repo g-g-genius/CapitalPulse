@@ -32,6 +32,19 @@ class SignalEngineTests(unittest.TestCase):
         self.assertEqual([event["signal_type"] for event in events], ["surge"])
         self.assertEqual(events[0]["source_time"], base + 58)
 
+    def test_post_outage_samples_do_not_reuse_pre_outage_money(self):
+        engine = SignalEngine()
+        base = 1790645400
+        for offset, value in [(0, -20_000_000), (60, 20_000_000),
+                              (63, 20_000_001), (66, 20_000_002)]:
+            self.assertEqual(engine.evaluate("sector", "BK0001", "测试", base + offset, value), [])
+        self.assertEqual(len(engine.samples[("sector", "BK0001")]), 3)
+
+    def test_invalid_number_does_not_poison_history(self):
+        engine = SignalEngine()
+        self.assertEqual(engine.evaluate("stock", "0.000001", "测试", 1790645400, float("nan")), [])
+        self.assertEqual(engine.samples, {})
+
 
 if __name__ == "__main__":
     unittest.main()

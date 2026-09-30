@@ -104,6 +104,20 @@ class SignalServiceTests(unittest.IsolatedAsyncioTestCase):
         third = self.auth.create_user("third@example.com", "用户丙", "third-password-2026")
         self.assertEqual(self.service.watchlist_quotes(third["id"])["quotes"], [])
 
+    async def test_incremental_event_pages_do_not_skip_backlog(self):
+        for index in range(6):
+            self.service.connection.execute(
+                "INSERT INTO signal_events (trade_date, source_time, entity_type, entity_code, entity_name, "
+                "signal_type, main_net, created_at) VALUES (?, ?, 'sector', ?, '测试', 'surge', 1, ?)",
+                (self.trade_date.isoformat(), self.base + index, f"BK{index:04d}", self.base),
+            )
+        self.service.connection.commit()
+        initial = self.service.recent_events(self.trade_date, None, limit=2)
+        self.assertEqual([row["id"] for row in initial], [6, 5])
+        first = self.service.recent_events(self.trade_date, None, since_id=1, limit=2)
+        second = self.service.recent_events(self.trade_date, None, since_id=first[-1]["id"], limit=2)
+        self.assertEqual([row["id"] for row in first + second], [2, 3, 4, 5])
+
 
 if __name__ == "__main__":
     unittest.main()

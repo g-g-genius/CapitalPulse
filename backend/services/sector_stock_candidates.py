@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import math
 import re
 import time
 from typing import Any
 
-from config import EASTMONEY_PUSH_URL, EASTMONEY_SECTOR_URL
+from config import EASTMONEY_PUSH_URL, EASTMONEY_SECTOR_URL, LIVE_REQUEST_TIMEOUT_SECONDS
 from utils.http_client import safe_fetch
 
 SECTOR_CODE_PATTERN = re.compile(r"^BK\d{4}$")
@@ -18,7 +19,17 @@ MIN_TURNOVER_RATE = 1.0
 MAX_CHANGE_PERCENT = 8.0
 FRESH_CACHE_SECONDS = 10
 STALE_CACHE_SECONDS = 120
+FETCH_TIMEOUT_SECONDS = 12
+_inflight: dict[tuple[str, int], asyncio.Task] = {}
 _candidate_cache: dict[tuple[str, int], tuple[float, dict[str, Any]]] = {}
+
+
+async def close_candidate_requests() -> None:
+    tasks = list(_inflight.values())
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    _inflight.clear()
 
 
 def _number(value: Any) -> float | None:
@@ -93,19 +104,50 @@ def rank_sector_stocks(items: list[Any], limit: int = 5) -> list[dict[str, Any]]
     return candidates[:limit]
 
 
-async def fetch_sector_stock_candidates(
-    sector_code: str, limit: int = 5
-) -> dict[str, Any] | None:
-    """Fetch a sector's constituents and return transparent short-term watch candidates."""
+def _cache_result(result: dict[str, Any]) -> dict[str, Any]:
+    stamps = [stock["source_time"] for stock in result["candidates"]] or [result.get("as_of") or 0]
+    now = time.time()
+    stale = any(not -5 <= now - stamp <= 15 for stamp in stamps)
+    return {**result, "stale": bool(result.get("stale") or stale)}
+
+
+async def fetch_sector_stock_candidates(sector_code: str, limit: int = 5) -> dict[str, Any] | None:
     if not SECTOR_CODE_PATTERN.fullmatch(sector_code):
         return None
+    key = (sector_code, limit)
+    cached = _candidate_cache.get(key)
+    if cached and time.monotonic() - cached[0] < FRESH_CACHE_SECONDS:
+        return _cache_result(cached[1])
+    task = _inflight.get(key)
+    if task is None:
+        task = asyncio.create_task(_bounded_refresh(sector_code, limit))
+        _inflight[key] = task
+        def finished(done):
+            if _inflight.get(key) is done:
+                _inflight.pop(key, None)
+            if not done.cancelled():
+                done.exception()
+        task.add_done_callback(finished)
+    # One disconnected browser must not cancel a request shared by others.
+    return await asyncio.shield(task)
 
+
+async def _bounded_refresh(sector_code: str, limit: int) -> dict[str, Any] | None:
+    try:
+        async with asyncio.timeout(FETCH_TIMEOUT_SECONDS):
+            result = await _refresh_candidates(sector_code, limit)
+        return _cache_result(result) if result else None
+    except TimeoutError:
+        cached = _candidate_cache.get((sector_code, limit))
+        if cached and time.monotonic() - cached[0] < STALE_CACHE_SECONDS:
+            return {**cached[1], "stale": True}
+        return None
+
+
+async def _refresh_candidates(sector_code: str, limit: int) -> dict[str, Any] | None:
     cache_key = (sector_code, limit)
     cached = _candidate_cache.get(cache_key)
-    cache_age = time.monotonic() - cached[0] if cached else None
-    if cached and cache_age is not None and cache_age < FRESH_CACHE_SECONDS:
-        return {**cached[1], "stale": False}
-
+    partial = False
     page_size = 20
     items: list[Any] = []
     total = 0
@@ -131,6 +173,7 @@ async def fetch_sector_stock_candidates(
                 url,
                 params=params,
                 headers={"Referer": "https://data.eastmoney.com/"},
+                timeout=LIVE_REQUEST_TIMEOUT_SECONDS, max_retries=1,
             )
             if not text:
                 continue
@@ -146,8 +189,9 @@ async def fetch_sector_stock_candidates(
                 continue
         if data is None:
             if items:
+                partial = True
                 break
-            if cached and cache_age is not None and cache_age < STALE_CACHE_SECONDS:
+            if cached and time.monotonic() - cached[0] < STALE_CACHE_SECONDS:
                 return {**cached[1], "stale": True}
             return None
         try:
@@ -175,7 +219,12 @@ async def fetch_sector_stock_candidates(
         "total_constituents": total,
         "scanned_constituents": len(items),
         "candidates": candidates,
-        "stale": False,
+        "stale": partial,
+        "partial": partial,
+        "complete": len(items) >= total,
     }
+    if len(_candidate_cache) >= 256 and cache_key not in _candidate_cache:
+        oldest = min(_candidate_cache, key=lambda key: _candidate_cache[key][0])
+        _candidate_cache.pop(oldest)
     _candidate_cache[cache_key] = (time.monotonic(), result)
     return result

@@ -15,12 +15,14 @@ from typing import Any
 from config import EASTMONEY_PUSH_URL, EASTMONEY_SECTOR_URL, LIVE_REQUEST_TIMEOUT_SECONDS
 from services.sector_flow_realtime import CST, MAX_FUTURE_SKEW_SECONDS, market_status_at
 from utils.http_client import safe_fetch
+from utils.flow_windows import window_change
 
 
 logger = logging.getLogger(__name__)
 POLL_SECONDS = 60
 PAGE_SIZE = 100
 MAX_PAGES = 70
+SCAN_TIMEOUT_SECONDS = 45
 SOURCE_AGE_SECONDS = 75
 SAMPLE_GAP_SECONDS = 150
 WINDOW_SECONDS = 300
@@ -51,7 +53,6 @@ def parse_stock_rows(items: list[Any]) -> list[dict[str, Any]]:
         quote_id = f"{market}.{code}"
         if quote_id in seen:
             continue
-        seen.add(quote_id)
         try:
             source_time = int(item.get("f124") or 0)
         except (TypeError, ValueError):
@@ -59,6 +60,7 @@ def parse_stock_rows(items: list[Any]) -> list[dict[str, Any]]:
         main_net = _number(item.get("f62"))
         if source_time <= 0 or main_net is None:
             continue
+        seen.add(quote_id)
         rows.append({
             "quote_id": quote_id,
             "code": code,
@@ -99,34 +101,50 @@ async def fetch_stock_page(page: int) -> tuple[int, list[Any]] | None:
     return None
 
 
-async def fetch_market_stocks() -> tuple[int, list[dict[str, Any]]] | None:
-    """Reject missing pages; never silently present a partial list as all-market."""
-    started = time.monotonic()
+async def fetch_market_stocks(progress: dict | None = None) -> tuple[int, list[dict[str, Any]]] | None:
+    """Bound the whole scan, including page retries, not just individual requests."""
+    progress = progress if progress is not None else {}
+    progress.update(expected=0, received=0, pages_completed=0, pages_total=0, error=None)
+    try:
+        async with asyncio.timeout(SCAN_TIMEOUT_SECONDS):
+            return await _fetch_market_stocks(progress)
+    except TimeoutError:
+        progress["error"] = "全市场扫描超时，本轮结果未用于异动计算"
+        return None
+
+
+async def _fetch_market_stocks(progress: dict) -> tuple[int, list[dict[str, Any]]] | None:
     first = await fetch_stock_page(1)
     if first is None:
+        progress["error"] = "股票列表首页请求失败，等待重试"
         return None
     total, first_items = first
     page_count = math.ceil(total / PAGE_SIZE)
+    progress.update(expected=total, pages_total=page_count, pages_completed=1, received=len(first_items))
     if page_count > MAX_PAGES:
+        progress["error"] = "股票数量超出扫描上限，请调整配置"
         return None
-    semaphore = asyncio.Semaphore(3)
-
-    async def fetch(page: int) -> tuple[int, list[Any]] | None:
-        async with semaphore:
-            return await fetch_stock_page(page)
-
     items = list(first_items)
     for start in range(2, page_count + 1, 3):
-        if time.monotonic() - started > 45:
-            return None
-        batch = await asyncio.gather(*(
-            fetch(page) for page in range(start, min(start + 3, page_count + 1))
-        ))
-        if any(page is None or page[0] != total for page in batch):
-            return None
-        items.extend(item for page in batch if page for item in page[1])
+        page_numbers = list(range(start, min(start + 3, page_count + 1)))
+        batch = await asyncio.gather(*(fetch_stock_page(page) for page in page_numbers))
+        # Retry only failed pages. Previously successful pages stay in this scan.
+        for index, result in enumerate(batch):
+            if result is None:
+                batch[index] = await fetch_stock_page(page_numbers[index])
+        for number, result in zip(page_numbers, batch):
+            if result is None or result[0] != total:
+                progress["error"] = f"第 {number} 页缺失或市场总数变化，本轮结果未使用"
+                return None
+            items.extend(result[1])
+            progress.update(pages_completed=progress["pages_completed"] + 1, received=len(items))
+    identities = {(item.get("f13"), str(item.get("f12"))) for item in items
+                  if isinstance(item, dict) and item.get("f13") in (0, 1)
+                  and len(str(item.get("f12", ""))) == 6 and str(item["f12"]).isdigit()}
     rows = parse_stock_rows(items)
-    if len(items) < total or len(rows) < total * 0.9:
+    # Distinguish complete pagination from stocks lacking usable flow fields.
+    if len(items) != total or len(identities) != total or len(rows) < math.ceil(total * 0.9):
+        progress["error"] = "股票列表重复、缺失或有效字段不足，本轮结果未使用"
         return None
     return total, rows
 
@@ -142,6 +160,11 @@ class MarketStockRadar:
         self._source_time: int | None = None
         self._last_error: str | None = None
         self._last_requested_at = 0.0
+        self._scan: dict[str, Any] = {}
+        self._scanning = False
+        self._last_success_at: str | None = None
+        self._next_scan_at: float | None = None
+        self._failures = 0
 
     async def start(self) -> None:
         if self._task is None or self._task.done():
@@ -160,10 +183,11 @@ class MarketStockRadar:
             current = datetime.now(CST)
             active = started - self._last_requested_at < 90
             if active and market_status_at(current) == "open":
+                self._scanning = True
                 try:
-                    batch = await fetch_market_stocks()
+                    batch = await fetch_market_stocks(self._scan)
                     if batch is None:
-                        self._last_error = "全市场股票快照不完整或请求失败"
+                        self._last_error = self._scan.get("error") or "全市场股票快照不完整或请求失败"
                     else:
                         self.ingest(*batch, datetime.now(CST))
                 except asyncio.CancelledError:
@@ -171,9 +195,13 @@ class MarketStockRadar:
                 except Exception:
                     self._last_error = "全市场股票快照采集失败"
                     logger.exception("[stock-radar] Market scan failed")
-            await asyncio.sleep(
-                max(1, POLL_SECONDS - (time.monotonic() - started)) if active else 5
-            )
+                finally:
+                    self._scanning = False
+                self._failures = self._failures + 1 if self._last_error else 0
+            interval = min(300, POLL_SECONDS * 2 ** min(self._failures, 2))
+            delay = max(1, interval - (time.monotonic() - started)) if active else 5
+            self._next_scan_at = time.time() + delay if active else None
+            await asyncio.sleep(delay)
 
     def ingest(self, total: int, rows: list[dict[str, Any]], current: datetime) -> None:
         if self._trade_date != current.date():
@@ -188,7 +216,7 @@ class MarketStockRadar:
             and -MAX_FUTURE_SKEW_SECONDS <= current.timestamp() - row["source_time"] <= SOURCE_AGE_SECONDS
         ]
         # An old response must not replace an already fresher scan.
-        if not fresh or len(fresh) < len(rows) * 0.2:
+        if not fresh or len(fresh) < math.ceil(total * 0.9):
             self._last_error = "股票源时间滞后，异动扫描已暂停"
             return
         latest_source_time = max(row["source_time"] for row in fresh)
@@ -202,8 +230,9 @@ class MarketStockRadar:
             if samples and stamp <= samples[-1][0]:
                 continue
             previous = samples[-1] if samples else None
-            if previous and stamp - previous[0] > WINDOW_SECONDS:
+            if previous and stamp - previous[0] > SAMPLE_GAP_SECONDS:
                 samples.clear()
+                self._turns.pop(code, None)
                 previous = None
             if (previous and stamp - previous[0] <= SAMPLE_GAP_SECONDS
                     and previous[1] <= 0 < row["main_net"]):
@@ -212,18 +241,30 @@ class MarketStockRadar:
             while samples and stamp - samples[0][0] > WINDOW_SECONDS:
                 samples.popleft()
             self._latest[code] = row
+        fresh_codes = {row["quote_id"] for row in fresh}
+        self._latest = {code: row for code, row in self._latest.items() if code in fresh_codes}
         self._total = total
         self._source_time = latest_source_time
         self._last_error = None
+        self._last_success_at = current.isoformat(timespec="seconds")
+
+    def status_data(self, current: datetime | None = None) -> dict[str, Any]:
+        now = current or datetime.now(CST)
+        age = now.timestamp() - self._source_time if self._source_time else None
+        status = market_status_at(now)
+        if status == "open" and (self._last_error or age is None or not -MAX_FUTURE_SKEW_SECONDS <= age <= SOURCE_AGE_SECONDS):
+            status = "stale"
+        return {"market_status": status, "source_time": self._source_time,
+                "source_age_seconds": round(age, 1) if age is not None else None,
+                "last_success_at": self._last_success_at, "last_error": self._last_error,
+                "scanning": self._scanning, "scan": dict(self._scan),
+                "next_scan_at": self._next_scan_at,
+                "worker_running": self._task is not None and not self._task.done()}
 
     def data(self, current: datetime | None = None) -> dict[str, Any]:
         self._last_requested_at = time.monotonic()
         now = current or datetime.now(CST)
-        status = market_status_at(now)
-        if status == "open" and (
-            self._source_time is None or now.timestamp() - self._source_time > SOURCE_AGE_SECONDS
-        ):
-            status = "stale"
+        status = self.status_data(now)
         candidates: list[dict[str, Any]] = []
         if self._trade_date == now.date():
             for code, row in self._latest.items():
@@ -233,9 +274,7 @@ class MarketStockRadar:
                 samples = self._samples[code]
 
                 def change(seconds: int) -> float | None:
-                    reference = next((value for time_, value in reversed(samples)
-                                      if time_ <= stamp - seconds), None)
-                    return row["main_net"] - reference if reference is not None else None
+                    return window_change(samples, stamp, row["main_net"], seconds, tolerance=15)
 
                 previous = samples[-2] if len(samples) >= 2 else None
                 scan_gap = stamp - previous[0] if previous else None
@@ -263,8 +302,8 @@ class MarketStockRadar:
         falling = sorted((row for row in with_change if row["change_scan"] < 0),
                          key=lambda row: row["change_scan"])[:15]
         return {
-            "market_status": status, "source_time": self._source_time,
-            "universe_count": self._total, "scanned_count": len(candidates),
+            **status,
+            "universe_count": self._scan.get("expected") or self._total, "scanned_count": len(candidates),
             "poll_seconds": POLL_SECONDS, "last_error": self._last_error,
             "turns": turns, "rising": rising, "falling": falling,
         }

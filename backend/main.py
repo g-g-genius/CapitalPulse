@@ -3,7 +3,7 @@
 import logging
 import os
 import sys
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI, WebSocket
@@ -16,7 +16,8 @@ from services.sector_flow_realtime import sector_flow_service
 from services.market_stock_radar import market_stock_radar
 from services.signal_service import signal_service
 from services.stock_flow_realtime import stock_flow_service
-from utils.http_client import close_client
+from services.sector_stock_candidates import close_candidate_requests
+from utils.http_client import close_client, transport_status
 
 # Configure logging
 logging.basicConfig(
@@ -31,18 +32,15 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Application lifespan: startup and shutdown."""
     logger.info("backend starting up...")
-    auth_service.ensure_schema()
-    await sector_flow_service.start()
-    await stock_flow_service.start()
-    await signal_service.start()
-    await market_stock_radar.start()
-    yield
-    logger.info("backend shutting down...")
-    await market_stock_radar.stop()
-    await signal_service.stop()
-    await stock_flow_service.stop()
-    await sector_flow_service.stop()
-    await close_client()
+    async with AsyncExitStack() as cleanup:
+        cleanup.push_async_callback(close_client)
+        cleanup.push_async_callback(close_candidate_requests)
+        auth_service.ensure_schema()
+        for service in (sector_flow_service, stock_flow_service, signal_service, market_stock_radar):
+            cleanup.push_async_callback(service.stop)
+            await service.start()
+        yield
+        logger.info("backend shutting down...")
 
 
 # Create FastAPI app
@@ -86,6 +84,10 @@ async def health_check():
         "data": {
             "status": "healthy",
             "sector_flow": sector_flow_service.status_data(),
+            "stock_radar": market_stock_radar.status_data(),
+            "upstream_requests": transport_status(),
+            "watchlist": {"monitored_stocks": signal_service.monitored_stocks,
+                          "last_error": signal_service.stock_poll_error},
         },
     }
 

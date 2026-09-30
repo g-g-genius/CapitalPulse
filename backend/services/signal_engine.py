@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from collections import deque
+import math
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from utils.flow_windows import window_change
 
 
 CST = timezone(timedelta(hours=8))
@@ -38,11 +40,13 @@ class SignalEngine:
     ) -> list[dict[str, Any]]:
         if entity_type not in THRESHOLDS:
             raise ValueError("unsupported signal entity type")
+        if source_time <= 0 or not math.isfinite(main_net):
+            return []
         key = (entity_type, entity_code)
         samples = self.samples.setdefault(key, deque())
         if samples and source_time <= samples[-1][0]:
             return []
-        if samples and source_time - samples[-1][0] > WINDOW_SECONDS:
+        if samples and source_time - samples[-1][0] > MAX_SAMPLE_GAP_SECONDS:
             samples.clear()
             self.surge_streaks.pop(key, None)
         previous = samples[-1] if samples else None
@@ -51,11 +55,7 @@ class SignalEngine:
             samples.popleft()
 
         def change(seconds: int) -> float | None:
-            reference = next(
-                (value for stamp, value in reversed(samples) if stamp <= source_time - seconds),
-                None,
-            )
-            return main_net - reference if reference is not None else None
+            return window_change(samples, source_time, main_net, seconds)
 
         delta_15s = change(15)
         delta_1m = change(60)

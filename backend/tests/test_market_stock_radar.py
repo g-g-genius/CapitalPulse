@@ -65,6 +65,70 @@ class MarketStockRadarTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(expired["market_status"], "stale")
         self.assertEqual(expired["scanned_count"], 0)
 
+    async def test_duplicate_identity_cannot_substitute_for_missing_stock(self):
+        items = [raw(f"{index:06d}", 0, self.stamp, 1) for index in range(9)]
+        items.append(items[0])
+        progress = {}
+        with patch("services.market_stock_radar.fetch_stock_page", new=AsyncMock(return_value=(10, items))):
+            self.assertIsNone(await fetch_market_stocks(progress))
+        self.assertIn("重复", progress["error"])
+
+    async def test_scan_deadline_cancels_a_hanging_page(self):
+        import asyncio
+        cancelled = asyncio.Event()
+        async def hanging(page):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+        progress = {}
+        with patch("services.market_stock_radar.SCAN_TIMEOUT_SECONDS", 0.01), patch(
+            "services.market_stock_radar.fetch_stock_page", side_effect=hanging
+        ):
+            self.assertIsNone(await asyncio.wait_for(fetch_market_stocks(progress), 0.5))
+        self.assertTrue(cancelled.is_set())
+        self.assertIn("超时", progress["error"])
+
+    async def test_only_failed_page_is_retried(self):
+        calls = []
+        async def page(number):
+            calls.append(number)
+            if number == 2 and calls.count(2) == 1:
+                return None
+            return (2, [raw(f"{number:06d}", 0, self.stamp, 1)])
+        with patch("services.market_stock_radar.PAGE_SIZE", 1), patch(
+            "services.market_stock_radar.fetch_stock_page", side_effect=page
+        ):
+            self.assertIsNotNone(await fetch_market_stocks())
+        self.assertEqual(calls, [1, 2, 2])
+
+    def test_mostly_stale_scan_is_not_healthy(self):
+        radar = MarketStockRadar()
+        items = [raw(f"{i:06d}", 0, self.stamp if i < 3 else self.stamp - 120, i) for i in range(10)]
+        radar.ingest(10, parse_stock_rows(items), self.base)
+        self.assertEqual(radar.status_data(self.base)["market_status"], "stale")
+        self.assertIsNone(radar._source_time)
+
+    def test_failed_scan_is_degraded_even_with_recent_saved_sample(self):
+        radar = MarketStockRadar()
+        radar.ingest(1, parse_stock_rows([raw("600001", 1, self.stamp, 1)]), self.base)
+        radar._last_error = "缺页"
+        self.assertEqual(radar.status_data(self.base)["market_status"], "stale")
+        self.assertEqual(radar._last_requested_at, 0)
+
+    def test_two_minute_gap_is_not_reported_as_one_minute(self):
+        radar = MarketStockRadar()
+        for offset in (0, 120):
+            radar.ingest(1, parse_stock_rows([raw("600001", 1, self.stamp + offset, offset)]),
+                         self.base + timedelta(seconds=offset))
+        row = radar.data(self.base + timedelta(seconds=120))["rising"][0]
+        self.assertEqual(row["window_seconds"], 120)
+        self.assertIsNone(row["change_1m"])
+
+    def test_invalid_first_duplicate_does_not_hide_valid_row(self):
+        items = [raw("600001", 1, self.stamp, None), raw("600001", 1, self.stamp, 100)]
+        self.assertEqual(len(parse_stock_rows(items)), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

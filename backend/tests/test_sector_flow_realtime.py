@@ -864,6 +864,45 @@ class SectorFlowDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(healthy, self.service._clients)
         self.assertNotIn(failed, self.service._clients)
 
+    def test_radar_uses_each_sector_timestamp_and_preserves_unchanged_row(self):
+        stamp = 1790645400
+        self.service._update_radar([make_flow("BK0001", stamp, -100), make_flow("BK0002", stamp + 5, 100)], stamp + 5)
+        self.assertEqual(self.service._radar["sectors"][0]["source_time"], stamp)
+        self.service._update_radar([make_flow("BK0001", stamp, -100), make_flow("BK0002", stamp + 8, 110)], stamp + 8)
+        self.assertEqual(len(self.service._radar["sectors"]), 2)
+        self.assertEqual(len(self.service._radar_samples["BK0001"]), 1)
+
+    def test_radar_resets_after_outage_without_false_turn(self):
+        stamp = 1790645400
+        self.service._update_radar([make_flow("BK0001", stamp, -100)], stamp)
+        self.service._update_radar([make_flow("BK0001", stamp + 60, 100)], stamp + 60)
+        row = self.service._radar["sectors"][0]
+        self.assertFalse(row["turned_positive"])
+        self.assertIsNone(row["change_15s"])
+
+    async def test_same_day_expired_snapshot_cannot_replace_ranking(self):
+        current = datetime(2026, 7, 27, 10, 0, tzinfo=CST)
+        self.service._selection = make_sectors(1)
+        with patch.object(self.service, "_ensure_selection", new=AsyncMock(return_value=True)), patch.object(
+            self.service, "_fetch_snapshot", new=AsyncMock(return_value=[make_flow("BK0001", int(current.timestamp()) - 60)])
+        ), patch.object(self.service, "_persist_snapshot") as persist:
+            self.assertFalse(await self.service.collect_once(current))
+        persist.assert_not_called()
+
+
+    async def test_selection_exception_does_not_kill_poll_worker(self):
+        import asyncio
+        current = datetime(2026, 7, 27, 10, 0, tzinfo=CST)
+        with patch("services.sector_flow_realtime.datetime") as clock, patch.object(
+            self.service, "_ensure_selection", new=AsyncMock(side_effect=[RuntimeError("temporary"), asyncio.CancelledError()])
+        ) as select, patch.object(self.service, "_set_status", new=AsyncMock()), patch(
+            "services.sector_flow_realtime.asyncio.sleep", new=AsyncMock()
+        ):
+            clock.now.return_value = current
+            with self.assertRaises(asyncio.CancelledError):
+                await self.service._poll_loop()
+        self.assertEqual(select.await_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

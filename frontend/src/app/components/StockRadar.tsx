@@ -25,6 +25,11 @@ type StockRadarItem = {
 type StockRadarData = {
   market_status: string
   source_time: number | null
+  source_age_seconds: number | null
+  scanning: boolean
+  scan: { pages_completed?: number; pages_total?: number; received?: number }
+  next_scan_at: number | null
+  last_success_at: string | null
   universe_count: number
   scanned_count: number
   poll_seconds: number
@@ -35,7 +40,7 @@ type StockRadarData = {
 }
 
 function amount(value: number | null): string {
-  if (value === null) return '—'
+  if (value === null || !Number.isFinite(value)) return '—'
   return `${value >= 0 ? '+' : ''}${(value / 1e8).toFixed(2)}亿`
 }
 
@@ -51,8 +56,9 @@ function Sparkline({ points }: { points: [number, number][] }) {
   const values = points.map((point) => point[1])
   const low = Math.min(...values)
   const span = Math.max(1, Math.max(...values) - low)
-  const path = points.map(([, value], index) => `${index ? 'L' : 'M'} ${(index / (points.length - 1) * 280).toFixed(1)} ${(70 - (value - low) / span * 64).toFixed(1)}`).join(' ')
-  return <svg viewBox="0 0 280 76" className="h-20 w-full" role="img" aria-label="最近四分钟主力资金走势"><path d={path} fill="none" stroke="currentColor" strokeWidth="2" className={values.at(-1)! >= values[0] ? 'text-red-600' : 'text-emerald-600'} /></svg>
+  const duration = Math.max(1, points[points.length - 1][0] - points[0][0])
+  const path = points.map(([stamp, value], index) => `${index ? 'L' : 'M'} ${((stamp - points[0][0]) / duration * 280).toFixed(1)} ${(70 - (value - low) / span * 64).toFixed(1)}`).join(' ')
+  return <svg viewBox="0 0 280 76" className="h-20 w-full" role="img" aria-label="最近五分钟主力资金走势"><path d={path} fill="none" stroke="currentColor" strokeWidth="2" className={values.at(-1)! >= values[0] ? 'text-red-600' : 'text-emerald-600'} /></svg>
 }
 
 export default function StockRadar({
@@ -64,31 +70,46 @@ export default function StockRadar({
 }) {
   const [data, setData] = useState<StockRadarData | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [tick, setTick] = useState(0)
+  const [receivedAt, setReceivedAt] = useState(0)
   const [focusedCode, setFocusedCode] = useState<string | null>(null)
 
   useEffect(() => {
     if (!active) return
     let disposed = false
     let inFlight = false
+    let controller: AbortController | null = null
     const poll = async () => {
-      if (inFlight) return
+      if (inFlight || document.visibilityState === 'hidden') return
       inFlight = true
+      controller = new AbortController()
+      const deadline = window.setTimeout(() => controller?.abort(), 10000)
       try {
-        const response = await fetch('/api/finance/stock-radar', { cache: 'no-store' })
+        const response = await fetch('/api/finance/stock-radar', { cache: 'no-store', signal: controller.signal })
         const payload = await response.json()
         if (!response.ok || payload.code !== 200 || !payload.data) {
           throw new Error(payload.msg || '个股异动加载失败')
         }
-        if (!disposed) { setData(payload.data as StockRadarData); setError(null) }
+        if (!disposed) { setData(payload.data as StockRadarData); setReceivedAt(Date.now()); setTick(Date.now()); setError(null) }
       } catch (cause) {
-        if (!disposed) setError(cause instanceof Error ? cause.message : '个股异动加载失败')
+        if (!disposed) setError(controller?.signal.aborted ? '请求超时，正在重试' : cause instanceof Error ? cause.message : '个股异动加载失败')
       } finally {
+        window.clearTimeout(deadline)
         inFlight = false
       }
     }
     void poll()
     const timer = window.setInterval(() => { void poll() }, 5000)
-    return () => { disposed = true; window.clearInterval(timer) }
+    const ageTimer = window.setInterval(() => setTick(Date.now()), 1000)
+    const onVisibility = () => { if (document.visibilityState === 'visible') { setTick(Date.now()); void poll() } }
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      disposed = true
+      controller?.abort()
+      window.clearInterval(timer)
+      window.clearInterval(ageTimer)
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
   }, [active])
 
   if (!active) return null
@@ -99,14 +120,18 @@ export default function StockRadar({
   ]
   const stocks = [...(data?.turns ?? []), ...(data?.rising ?? []), ...(data?.falling ?? [])]
   const focused = stocks.find((stock) => stock.quote_id === focusedCode) ?? stocks[0]
-  const isLive = data?.market_status === 'open'
+  const localAge = (data?.source_age_seconds ?? Infinity) + Math.max(0, tick - receivedAt) / 1000
+  const connectionDelayed = receivedAt > 0 && tick - receivedAt > 15000
+  const isLive = data?.market_status === 'open' && !error && !connectionDelayed && localAge <= 75
+  const delayed = data?.market_status === 'stale' || (data?.market_status === 'open' && !isLive)
 
   return <div className="min-h-[560px] bg-slate-50/70 p-4 dark:bg-slate-950/40">
     <div className="mb-4 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
       <span className="inline-flex items-center gap-1.5"><Radio size={14} />全市场沪深京 A 股 · 已取得 {data?.scanned_count ?? 0} / {data?.universe_count ?? 0} 只有效快照 · 约 {data?.poll_seconds ?? 60} 秒扫描</span>
       <span className="inline-flex items-center gap-1"><Clock3 size={13} />源时间 {clock(data?.source_time ?? null)} · {isLive ? '实时' : data?.market_status === 'closed' ? '已休市' : data?.market_status === 'lunch' ? '午间休市' : data?.market_status === 'preopen' ? '尚未开盘' : '数据延迟'}</span>
     </div>
-    {(error || data?.last_error || data?.market_status === 'stale') && <p role="status" className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300">{error || data?.last_error || '上游源时间已过期，等待下一次完整扫描'}</p>}
+    {(error || data?.last_error || delayed) && <p role="status" className="mb-4 rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-900 dark:bg-amber-950/40 dark:text-amber-300">{error || data?.last_error || '上游源时间已过期，等待下一次完整扫描'}；已显示的结果仅供回看，暂停实时判断。</p>}
+    {data?.scan?.pages_total !== undefined && <p className="mb-3 text-xs text-slate-500" role="status">{data.scanning ? '正在扫描' : '最近一次扫描'}：{data.scan.pages_completed ?? 0}/{data.scan.pages_total || '—'} 页 · 已接收 {data.scan.received ?? 0} 只{data.next_scan_at && !data.scanning && data.market_status !== 'closed' ? ` · 下次尝试 ${clock(data.next_scan_at)}` : ''}</p>}
     {!data && !error && <div className="radar-empty"><Activity size={32} /><h3>正在读取个股异动</h3><p>积累至少两次完整市场快照后显示本轮变化。</p></div>}
     {data && stocks.length === 0 && <div className="radar-empty"><Radar size={36} /><h3>{data.market_status === 'closed' ? '休市期间暂停个股扫描' : '等待有效异动'}</h3><p>只展示源时间有效、完成全市场扫描且有短时资金变化的股票。</p></div>}
     {stocks.length > 0 && <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
@@ -128,7 +153,7 @@ export default function StockRadar({
           <div className={`mt-3 font-mono text-2xl font-semibold ${focused.main_net >= 0 ? 'text-red-600' : 'text-emerald-600'}`}>{amount(focused.main_net)}</div>
           <p className="mt-1 text-xs text-slate-500">当日累计主力净流入 · 现价 {focused.price === null ? '—' : `¥${focused.price.toFixed(2)}`}</p>
           <div className="mt-5 grid grid-cols-3 gap-2 text-xs">{([[`本轮${focused.window_seconds === null ? '' : ` ${focused.window_seconds}秒`}`, focused.change_scan], ['1 分钟', focused.change_1m], ['3 分钟', focused.change_3m]] as const).map(([label, value]) => <div key={label} className="rounded-lg bg-slate-50 p-2 dark:bg-slate-800"><div className="text-slate-500">{label}变化</div><div className={`mt-1 font-mono font-semibold ${value === null ? 'text-slate-400' : value >= 0 ? 'text-red-600' : 'text-emerald-600'}`}>{amount(value)}</div></div>)}</div>
-          <div className="mt-5 border-t border-slate-100 pt-3 dark:border-slate-800"><p className="mb-2 text-xs text-slate-500">最近 4 分钟主力资金轨迹</p><Sparkline points={focused.points} /><p className="mt-1 text-right text-[11px] text-slate-500">源时间 {clock(focused.source_time)}</p></div>
+          <div className="mt-5 border-t border-slate-100 pt-3 dark:border-slate-800"><p className="mb-2 text-xs text-slate-500">最近 5 分钟主力资金轨迹</p><Sparkline points={focused.points} /><p className="mt-1 text-right text-[11px] text-slate-500">源时间 {clock(focused.source_time)}</p></div>
           <button type="button" onClick={() => onOpenStock({ quote_id: focused.quote_id, code: focused.code, name: focused.name, market_name: focused.market_name, pinyin: '' })} className="mt-4 inline-flex items-center gap-1 rounded-lg border border-slate-300 px-3 py-2 text-xs font-medium hover:bg-slate-50 dark:border-slate-700 dark:hover:bg-slate-800">查看个股资金曲线 <ArrowUpRight size={14} /></button>
         </>}
       </aside>

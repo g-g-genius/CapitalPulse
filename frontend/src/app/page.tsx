@@ -165,6 +165,7 @@ type SectorCandidateData = {
   sector_code: string
   as_of: number | null
   total_constituents: number
+  partial?: boolean
   scanned_constituents: number
   candidates: SectorStockCandidate[]
   stale: boolean
@@ -2423,7 +2424,7 @@ export default function SectorFlowPage() {
                     </div>
                     <p className="mt-1 text-[11px] leading-4 text-slate-500">
                       {candidateData?.sector_code === pinnedCode
-                        ? `东方财富${candidateData.stale ? '缓存' : ''} · ${formatQuoteDateTime(candidateData.as_of)} · 已筛 ${candidateData.scanned_constituents}/${candidateData.total_constituents} 只`
+                        ? `东方财富${candidateData.partial ? '部分数据' : candidateData.stale ? '缓存/延迟' : ''} · ${formatQuoteDateTime(candidateData.as_of)} · 已筛 ${candidateData.scanned_constituents}/${candidateData.total_constituents} 只`
                         : '按板块成分股最新行情筛选'}
                     </p>
                   </div>

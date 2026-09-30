@@ -65,3 +65,40 @@ class SectorStockCandidateTests(unittest.IsolatedAsyncioTestCase):
             result = await fetch_sector_stock_candidates("BK1033&evil=1")
         self.assertIsNone(result)
         fetch.assert_not_awaited()
+
+    async def test_concurrent_readers_share_one_refresh_and_keep_stale_label(self):
+        import asyncio
+        payload = json.dumps({"data": {"total": 1, "diff": [quote()]}})
+        async def delayed(*args, **kwargs):
+            await asyncio.sleep(0.01)
+            return payload
+        with patch("services.sector_stock_candidates.safe_fetch", new=AsyncMock(side_effect=delayed)) as fetch:
+            results = await asyncio.gather(*(fetch_sector_stock_candidates("BK1033") for _ in range(8)))
+            cached = await fetch_sector_stock_candidates("BK1033")
+        self.assertEqual(fetch.await_count, 1)
+        self.assertTrue(all(result["stale"] for result in results))
+        self.assertTrue(cached["stale"])
+
+    async def test_hanging_refresh_uses_recent_cache_with_deadline(self):
+        import asyncio
+        payload = json.dumps({"data": {"total": 1, "diff": [quote()]}})
+        with patch("services.sector_stock_candidates.safe_fetch", new=AsyncMock(return_value=payload)):
+            await fetch_sector_stock_candidates("BK1033")
+        created, result = candidate_service._candidate_cache[("BK1033", 5)]
+        candidate_service._candidate_cache[("BK1033", 5)] = (created - 11, result)
+        async def hanging(*args, **kwargs):
+            await asyncio.Event().wait()
+        with patch("services.sector_stock_candidates.FETCH_TIMEOUT_SECONDS", 0.01), patch(
+            "services.sector_stock_candidates.safe_fetch", side_effect=hanging
+        ):
+            result = await asyncio.wait_for(fetch_sector_stock_candidates("BK1033"), 0.5)
+        self.assertTrue(result["stale"])
+
+    async def test_failed_later_page_is_labelled_partial(self):
+        items = [quote(f"{i:06d}", f62=-1) for i in range(20)]
+        payload = json.dumps({"data": {"total": 40, "diff": items}})
+        with patch("services.sector_stock_candidates.safe_fetch", new=AsyncMock(side_effect=[payload, None, None, None])):
+            result = await fetch_sector_stock_candidates("BK1033")
+        self.assertTrue(result["partial"])
+        self.assertTrue(result["stale"])
+        self.assertFalse(result["complete"])

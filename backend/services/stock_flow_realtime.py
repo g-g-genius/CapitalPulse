@@ -14,6 +14,7 @@ from typing import Any
 
 from fastapi import WebSocket, WebSocketDisconnect
 
+from utils.trading_calendar import is_trading_day
 from database import MysqlConnection, open_database, using_mysql
 from config import env_path
 from services.sector_flow_realtime import (
@@ -227,7 +228,7 @@ class StockFlowRealtimeService:
         """Backfill today's minute history before continuing with live seconds."""
         current = now or datetime.now(CST)
         if (
-            current.weekday() >= 5
+            not is_trading_day(current.date())
             or current.timetz().replace(tzinfo=None) <= MORNING_START
         ):
             return 0
@@ -369,6 +370,8 @@ class StockFlowRealtimeService:
         if not data or int(data.get("source_time") or 0) <= 0:
             return False
         source_time = int(data["source_time"])
+        if source_time <= self._last_source_times.get(quote_id, 0):
+            return False
         if (
             datetime.fromtimestamp(source_time, CST).date() != current.date()
             or not -MAX_FUTURE_SKEW_SECONDS
